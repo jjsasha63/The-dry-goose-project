@@ -1,678 +1,455 @@
+"""
+Universal Excel Scraper
+========================
+A robust Python script for extracting data from non-uniform Excel files with:
+- Multiple sheets
+- Formulas
+- Tables in various orientations (horizontal/vertical)
+- Multiple datasets per sheet
+- Tables located anywhere in the sheet
 
-from __future__ import annotations
+Requirements:
+pip install pandas openpyxl numpy
 
-import os
+Author: Data Engineering Solution
+Date: 2025-11-12
+"""
+
+import pandas as pd
+import openpyxl
+from openpyxl import load_workbook
+import numpy as np
+from typing import List, Tuple, Dict, Any, Optional
 import json
-from typing import Dict, Any, List, Optional, Tuple
-from dataclasses import dataclass, asdict
-from datetime import datetime
-
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, IntegerType
-from pyspark.sql.functions import (
-    col, lit, when, isnan, isnull, mean, stddev, percentile_approx,
-    row_number, rank, dense_rank, abs as spark_abs, sqrt, pow as spark_pow
-)
-from pyspark.sql.window import Window
-from pyspark.ml import Pipeline, PipelineModel, Transformer
-from pyspark.ml.param.shared import HasInputCol, HasOutputCol, Param, Params
-from pyspark.ml.util import DefaultParamsReadable, DefaultParamsWritable
-from pyspark.ml.feature import (
-    VectorAssembler, StandardScaler, StringIndexer, OneHotEncoder,
-    PCA, Imputer, QuantileDiscretizer, Bucketizer
-)
-from pyspark.ml.clustering import KMeans, BisectingKMeans
-from pyspark.ml.stat import Summarizer
-from pyspark.ml.linalg import Vectors, VectorUDT
-import pyspark.sql.functions as F
+from pathlib import Path
 
 
-@dataclass
-class AnomalyConfig:
-    """Configuration for anomaly detection - fully serializable."""
-    contamination: float = 0.05
-    n_clusters: int = 8
-    statistical_threshold: float = 3.0
-    distance_threshold_percentile: float = 95.0
-    ensemble_weights: Dict[str, float] = None
-    
-    def __post_init__(self):
-        if self.ensemble_weights is None:
-            self.ensemble_weights = {
-                'cluster_distance': 0.3,
-                'statistical_outlier': 0.3,
-                'isolation_score': 0.2,
-                'density_score': 0.2
-            }
+class ExcelTableDetector:
+    """Detects and extracts tables from Excel sheets using multiple strategies."""
 
+    def __init__(self, file_path: str, data_only: bool = True):
+        """
+        Initialize the Excel scraper.
 
-class StatisticalOutlierTransformer(Transformer, HasInputCol, HasOutputCol, 
-                                   DefaultParamsReadable, DefaultParamsWritable):
-    """Pure Spark ML transformer for statistical outlier detection."""
-    
-    threshold = Param(Params._dummy(), "threshold", "Statistical threshold for outliers")
-    
-    def __init__(self, inputCol: str = "features", outputCol: str = "statistical_score", 
-                 threshold: float = 3.0):
-        super().__init__()
-        self._setDefault(threshold=3.0)
-        self._set(inputCol=inputCol, outputCol=outputCol, threshold=threshold)
-    
-    def setThreshold(self, value: float):
-        return self._set(threshold=value)
-    
-    def getThreshold(self):
-        return self.getOrDefault(self.threshold)
-    
-    def _transform(self, dataset: DataFrame) -> DataFrame:
-        input_col = self.getInputCol()
-        output_col = self.getOutputCol()
-        threshold = self.getThreshold()
-        
-        # Calculate feature-wise statistics using Summarizer
-        stats = dataset.select(
-            Summarizer.mean(col(input_col)).alias("mean_vector"),
-            Summarizer.std(col(input_col)).alias("std_vector")
-        ).collect()[0]
-        
-        mean_vals = stats["mean_vector"].toArray()
-        std_vals = stats["std_vector"].toArray()
-        
-        # Create UDF for z-score calculation
-        from pyspark.sql.functions import udf
-        from pyspark.sql.types import DoubleType
-        
-        def calculate_z_score(features):
-            if features is None:
-                return 0.0
-            z_scores = []
-            for i, val in enumerate(features.toArray()):
-                if std_vals[i] > 0:
-                    z_score = abs(val - mean_vals[i]) / std_vals[i]
-                    z_scores.append(z_score)
-            return max(z_scores) if z_scores else 0.0
-        
-        z_score_udf = udf(calculate_z_score, DoubleType())
-        
-        return dataset.withColumn(output_col, z_score_udf(col(input_col)))
+        Args:
+            file_path: Path to the Excel file
+            data_only: If True, read formula results; if False, read formulas
+        """
+        self.file_path = file_path
+        self.data_only = data_only
+        self.workbook = load_workbook(file_path, data_only=data_only)
 
+    def get_sheet_names(self) -> List[str]:
+        """Get all sheet names in the workbook."""
+        return self.workbook.sheetnames
 
-class ClusterDistanceTransformer(Transformer, HasInputCol, HasOutputCol,
-                                DefaultParamsReadable, DefaultParamsWritable):
-    """Transformer that adds cluster distance scores."""
-    
-    clusterCenters = Param(Params._dummy(), "clusterCenters", "Cluster centers")
-    
-    def __init__(self, inputCol: str = "features", outputCol: str = "cluster_distance"):
-        super().__init__()
-        self._set(inputCol=inputCol, outputCol=outputCol)
-    
-    def setClusterCenters(self, centers):
-        return self._set(clusterCenters=centers)
-    
-    def getClusterCenters(self):
-        return self.getOrDefault(self.clusterCenters)
-    
-    def _transform(self, dataset: DataFrame) -> DataFrame:
-        input_col = self.getInputCol()
-        output_col = self.getOutputCol()
-        
-        # This would be set during pipeline fitting
-        if not self.isDefined(self.clusterCenters):
-            raise ValueError("Cluster centers must be set before transformation")
-        
-        centers = self.getClusterCenters()
-        
-        from pyspark.sql.functions import udf
-        from pyspark.sql.types import DoubleType
-        import math
-        
-        def min_distance_to_centers(features):
-            if features is None:
-                return float('inf')
-            min_dist = float('inf')
-            feature_array = features.toArray()
-            for center in centers:
-                dist = sum((feature_array[i] - center[i]) ** 2 for i in range(len(feature_array)))
-                min_dist = min(min_dist, math.sqrt(dist))
-            return min_dist
-        
-        distance_udf = udf(min_distance_to_centers, DoubleType())
-        return dataset.withColumn(output_col, distance_udf(col(input_col)))
+    def detect_table_boundaries(self, sheet_name: str, 
+                               threshold: int = 3) -> List[Dict[str, Any]]:
+        """
+        Detect multiple tables in a sheet based on non-empty cell patterns.
 
+        Args:
+            sheet_name: Name of the sheet to analyze
+            threshold: Minimum number of consecutive non-empty cells to consider a row/col as part of table
 
-class IsolationScoreTransformer(Transformer, HasInputCol, HasOutputCol,
-                               DefaultParamsReadable, DefaultParamsWritable):
-    """Simplified isolation forest score using statistical approximation."""
-    
-    def __init__(self, inputCol: str = "features", outputCol: str = "isolation_score"):
-        super().__init__()
-        self._set(inputCol=inputCol, outputCol=outputCol)
-    
-    def _transform(self, dataset: DataFrame) -> DataFrame:
-        input_col = self.getInputCol()
-        output_col = self.getOutputCol()
-        
-        # Approximate isolation score using feature variance and extremeness
-        from pyspark.sql.functions import udf
-        from pyspark.sql.types import DoubleType
-        
-        # Calculate global statistics first
-        stats = dataset.select(
-            Summarizer.mean(col(input_col)).alias("mean_vector"),
-            Summarizer.std(col(input_col)).alias("std_vector"),
-            Summarizer.min(col(input_col)).alias("min_vector"),
-            Summarizer.max(col(input_col)).alias("max_vector")
-        ).collect()[0]
-        
-        mean_vals = stats["mean_vector"].toArray()
-        std_vals = stats["std_vector"].toArray()
-        min_vals = stats["min_vector"].toArray()
-        max_vals = stats["max_vector"].toArray()
-        
-        def calculate_isolation_score(features):
-            if features is None:
-                return 0.0
-            
-            feature_array = features.toArray()
-            isolation_factors = []
-            
-            for i, val in enumerate(feature_array):
-                # Measure how extreme the value is in its distribution
-                if std_vals[i] > 0:
-                    # Distance from mean in standard deviations
-                    z_score = abs(val - mean_vals[i]) / std_vals[i]
-                    
-                    # Position in the range (0=min, 1=max)
-                    if max_vals[i] != min_vals[i]:
-                        range_position = (val - min_vals[i]) / (max_vals[i] - min_vals[i])
-                        extremeness = min(range_position, 1 - range_position)
-                    else:
-                        extremeness = 0.0
-                    
-                    # Combine z-score and extremeness
-                    isolation_factor = z_score * (1 - extremeness)
-                    isolation_factors.append(isolation_factor)
-            
-            return sum(isolation_factors) / len(isolation_factors) if isolation_factors else 0.0
-        
-        isolation_udf = udf(calculate_isolation_score, DoubleType())
-        return dataset.withColumn(output_col, isolation_udf(col(input_col)))
+        Returns:
+            List of dictionaries containing table boundaries and metadata
+        """
+        # Load sheet with pandas to get all data
+        df = pd.read_excel(self.file_path, sheet_name=sheet_name, header=None)
 
+        # Identify rows and columns with data
+        row_has_data = df.notna().sum(axis=1) >= threshold
+        col_has_data = df.notna().sum(axis=0) >= threshold
 
-class DensityScoreTransformer(Transformer, HasInputCol, HasOutputCol,
-                             DefaultParamsReadable, DefaultParamsWritable):
-    """Local density estimation using k-nearest neighbors approximation."""
-    
-    k = Param(Params._dummy(), "k", "Number of neighbors for density estimation")
-    
-    def __init__(self, inputCol: str = "features", outputCol: str = "density_score", k: int = 10):
-        super().__init__()
-        self._setDefault(k=10)
-        self._set(inputCol=inputCol, outputCol=outputCol, k=k)
-    
-    def setK(self, value: int):
-        return self._set(k=value)
-    
-    def getK(self):
-        return self.getOrDefault(self.k)
-    
-    def _transform(self, dataset: DataFrame) -> DataFrame:
-        input_col = self.getInputCol()
-        output_col = self.getOutputCol()
-        k = self.getK()
-        
-        # Approximate density using distance to k-th nearest cluster center
-        # This is a simplified approach suitable for large-scale processing
-        
-        # Use percentile-based density estimation
-        from pyspark.sql.functions import udf
-        from pyspark.sql.types import DoubleType
-        
-        # Calculate feature-wise percentiles for density estimation
-        percentiles = [0.1, 0.25, 0.5, 0.75, 0.9]
-        
-        stats = dataset.select(
-            Summarizer.mean(col(input_col)).alias("mean_vector")
-        ).collect()[0]
-        
-        mean_vals = stats["mean_vector"].toArray()
-        
-        def calculate_density_score(features):
-            if features is None:
-                return 1.0  # High density score (low density)
-            
-            feature_array = features.toArray()
-            
-            # Calculate distance from feature centroid
-            centroid_distance = sum((val - mean_vals[i]) ** 2 for i, val in enumerate(feature_array))
-            centroid_distance = centroid_distance ** 0.5
-            
-            # Convert distance to density score (higher distance = lower density = higher score)
-            density_score = min(centroid_distance, 10.0) / 10.0  # Normalize to [0, 1]
-            
-            return density_score
-        
-        density_udf = udf(calculate_density_score, DoubleType())
-        return dataset.withColumn(output_col, density_udf(col(input_col)))
+        # Find contiguous blocks of rows with data
+        tables = []
+        in_table = False
+        start_row = None
 
+        for idx, has_data in enumerate(row_has_data):
+            if has_data and not in_table:
+                start_row = idx
+                in_table = True
+            elif not has_data and in_table:
+                # Found end of table
+                end_row = idx - 1
 
-class StatelessAnomalyDetectionPipeline:
-    """
-    Stateless anomaly detection pipeline using pure Spark ML components.
-    No threading objects or custom state - completely serializable.
-    """
-    
-    @staticmethod
-    def create_preprocessing_pipeline(df: DataFrame, 
-                                    config: AnomalyConfig) -> Pipeline:
-        """Create preprocessing pipeline for feature engineering."""
-        
-        # Identify column types
-        numeric_cols = []
-        categorical_cols = []
-        
-        for field in df.schema.fields:
-            if isinstance(field.dataType, (IntegerType, DoubleType)):
-                numeric_cols.append(field.name)
-            else:
-                categorical_cols.append(field.name)
-        
-        stages = []
-        
-        # Handle missing values in numeric columns
-        if numeric_cols:
-            imputer = Imputer(
-                inputCols=numeric_cols,
-                outputCols=[f"{col}_imputed" for col in numeric_cols],
-                strategy="mean"
-            )
-            stages.append(imputer)
-            numeric_cols = [f"{col}_imputed" for col in numeric_cols]
-        
-        # Process categorical columns
-        encoded_categorical_cols = []
-        for col_name in categorical_cols:
-            # String indexing
-            indexer = StringIndexer(
-                inputCol=col_name,
-                outputCol=f"{col_name}_indexed",
-                handleInvalid="keep"
-            )
-            stages.append(indexer)
-            
-            # One-hot encoding
-            encoder = OneHotEncoder(
-                inputCol=f"{col_name}_indexed",
-                outputCol=f"{col_name}_encoded"
-            )
-            stages.append(encoder)
-            encoded_categorical_cols.append(f"{col_name}_encoded")
-        
-        # Combine all features
-        all_feature_cols = numeric_cols + encoded_categorical_cols
-        if all_feature_cols:
-            assembler = VectorAssembler(
-                inputCols=all_feature_cols,
-                outputCol="raw_features",
-                handleInvalid="keep"
-            )
-            stages.append(assembler)
-            
-            # Scale features
-            scaler = StandardScaler(
-                inputCol="raw_features",
-                outputCol="scaled_features",
-                withStd=True,
-                withMean=True
-            )
-            stages.append(scaler)
+                # Find column boundaries for this table
+                table_df = df.iloc[start_row:end_row+1]
+                table_col_has_data = table_df.notna().sum(axis=0) >= 1
+
+                # Find contiguous column ranges
+                col_start = None
+                for col_idx, col_data in enumerate(table_col_has_data):
+                    if col_data and col_start is None:
+                        col_start = col_idx
+                    elif not col_data and col_start is not None:
+                        col_end = col_idx - 1
+
+                        # Extract this table
+                        table_data = df.iloc[start_row:end_row+1, col_start:col_end+1]
+
+                        if not table_data.empty and table_data.notna().sum().sum() > 0:
+                            tables.append({
+                                'row_start': start_row,
+                                'row_end': end_row,
+                                'col_start': col_start,
+                                'col_end': col_end,
+                                'data': table_data
+                            })
+                        col_start = None
+
+                # Handle case where table extends to last column
+                if col_start is not None:
+                    col_end = len(table_col_has_data) - 1
+                    table_data = df.iloc[start_row:end_row+1, col_start:col_end+1]
+                    if not table_data.empty and table_data.notna().sum().sum() > 0:
+                        tables.append({
+                            'row_start': start_row,
+                            'row_end': end_row,
+                            'col_start': col_start,
+                            'col_end': col_end,
+                            'data': table_data
+                        })
+
+                in_table = False
+
+        # Handle case where table extends to last row
+        if in_table:
+            end_row = len(row_has_data) - 1
+            table_df = df.iloc[start_row:end_row+1]
+            table_col_has_data = table_df.notna().sum(axis=0) >= 1
+
+            col_start = None
+            for col_idx, col_data in enumerate(table_col_has_data):
+                if col_data and col_start is None:
+                    col_start = col_idx
+                elif not col_data and col_start is not None:
+                    col_end = col_idx - 1
+                    table_data = df.iloc[start_row:end_row+1, col_start:col_end+1]
+                    if not table_data.empty and table_data.notna().sum().sum() > 0:
+                        tables.append({
+                            'row_start': start_row,
+                            'row_end': end_row,
+                            'col_start': col_start,
+                            'col_end': col_end,
+                            'data': table_data
+                        })
+                    col_start = None
+
+            if col_start is not None:
+                col_end = len(table_col_has_data) - 1
+                table_data = df.iloc[start_row:end_row+1, col_start:col_end+1]
+                if not table_data.empty and table_data.notna().sum().sum() > 0:
+                    tables.append({
+                        'row_start': start_row,
+                        'row_end': end_row,
+                        'col_start': col_start,
+                        'col_end': col_end,
+                        'data': table_data
+                    })
+
+        return tables
+
+    def detect_orientation(self, table_data: pd.DataFrame) -> str:
+        """
+        Detect if table is horizontal or vertical based on data patterns.
+
+        Args:
+            table_data: DataFrame containing the table
+
+        Returns:
+            'horizontal' or 'vertical'
+        """
+        rows, cols = table_data.shape
+
+        # Simple heuristic: if more columns than rows, likely horizontal
+        if cols > rows:
+            return 'horizontal'
         else:
-            raise ValueError("No valid columns found for feature extraction")
-        
-        return Pipeline(stages=stages)
-    
-    @staticmethod
-    def create_anomaly_detection_pipeline(config: AnomalyConfig) -> Pipeline:
-        """Create anomaly detection pipeline using ensemble of methods."""
-        
-        stages = []
-        
-        # 1. Clustering for distance-based anomalies
-        kmeans = KMeans(
-            k=config.n_clusters,
-            featuresCol="scaled_features",
-            predictionCol="cluster",
-            seed=42
-        )
-        stages.append(kmeans)
-        
-        # 2. Statistical outlier detection
-        statistical_transformer = StatisticalOutlierTransformer(
-            inputCol="scaled_features",
-            outputCol="statistical_score",
-            threshold=config.statistical_threshold
-        )
-        stages.append(statistical_transformer)
-        
-        # 3. Isolation score approximation
-        isolation_transformer = IsolationScoreTransformer(
-            inputCol="scaled_features",
-            outputCol="isolation_score"
-        )
-        stages.append(isolation_transformer)
-        
-        # 4. Density score
-        density_transformer = DensityScoreTransformer(
-            inputCol="scaled_features",
-            outputCol="density_score",
-            k=min(10, config.n_clusters)
-        )
-        stages.append(density_transformer)
-        
-        return Pipeline(stages=stages)
-    
-    @staticmethod
-    def add_cluster_distance_score(df: DataFrame, 
-                                 fitted_kmeans, 
-                                 config: AnomalyConfig) -> DataFrame:
-        """Add cluster distance scores after K-means fitting."""
-        
-        centers = fitted_kmeans.clusterCenters()
-        
-        from pyspark.sql.functions import udf
-        from pyspark.sql.types import DoubleType
-        import math
-        
-        def min_distance_to_centers(features, cluster_id):
-            if features is None:
-                return float('inf')
-            
-            feature_array = features.toArray()
-            center = centers[int(cluster_id)]
-            
-            distance = sum((feature_array[i] - center[i]) ** 2 for i in range(len(feature_array)))
-            return math.sqrt(distance)
-        
-        distance_udf = udf(min_distance_to_centers, DoubleType())
-        
-        return df.withColumn("cluster_distance", 
-                           distance_udf(col("scaled_features"), col("cluster")))
-    
-    @staticmethod
-    def calculate_ensemble_score(df: DataFrame, config: AnomalyConfig) -> DataFrame:
-        """Calculate final ensemble anomaly score."""
-        
-        weights = config.ensemble_weights
-        
-        # Normalize individual scores to [0, 1] range
-        score_columns = ['cluster_distance', 'statistical_score', 'isolation_score', 'density_score']
-        
-        for score_col in score_columns:
-            if score_col in df.columns:
-                # Get min/max for normalization
-                min_max = df.select(
-                    F.min(score_col).alias("min_val"),
-                    F.max(score_col).alias("max_val")
-                ).collect()[0]
-                
-                min_val = min_max["min_val"]
-                max_val = min_max["max_val"]
-                
-                if max_val > min_val:
-                    df = df.withColumn(f"{score_col}_normalized",
-                                     (col(score_col) - min_val) / (max_val - min_val))
-                else:
-                    df = df.withColumn(f"{score_col}_normalized", lit(0.0))
-        
-        # Calculate weighted ensemble score
-        ensemble_expr = lit(0.0)
-        for score_col, weight in weights.items():
-            normalized_col = f"{score_col}_normalized"
-            if normalized_col in df.columns:
-                ensemble_expr = ensemble_expr + (col(normalized_col) * weight)
-        
-        df = df.withColumn("ensemble_score", ensemble_expr)
-        
-        # Determine anomaly threshold
-        threshold = df.approxQuantile("ensemble_score", [1.0 - config.contamination], 0.01)[0]
-        
-        # Create binary predictions
-        df = df.withColumn("anomaly_prediction",
-                         when(col("ensemble_score") > threshold, 1).otherwise(0))
-        
-        return df
+            return 'vertical'
 
-
-class StatelessAnomalyDetector:
-    """
-    Main interface for stateless anomaly detection.
-    All operations are functional - no mutable state stored.
-    """
-    
-    def __init__(self, config: Optional[AnomalyConfig] = None):
-        self.config = config or AnomalyConfig()
-    
-    def fit(self, df: DataFrame) -> Tuple[PipelineModel, PipelineModel, Dict[str, Any]]:
+    def find_header_row(self, table_data: pd.DataFrame) -> Optional[int]:
         """
-        Fit preprocessing and anomaly detection pipelines.
-        
+        Attempt to identify the header row based on data patterns.
+
+        Args:
+            table_data: DataFrame containing the table
+
         Returns:
-            preprocessing_model: Fitted preprocessing pipeline
-            anomaly_model: Fitted anomaly detection pipeline  
-            meta Model metadata
+            Index of likely header row, or None
         """
-        
-        # Create and fit preprocessing pipeline
-        preprocessing_pipeline = StatelessAnomalyDetectionPipeline.create_preprocessing_pipeline(
-            df, self.config
-        )
-        preprocessing_model = preprocessing_pipeline.fit(df)
-        
-        # Transform data for anomaly detection
-        preprocessed_df = preprocessing_model.transform(df)
-        
-        # Create and fit anomaly detection pipeline
-        anomaly_pipeline = StatelessAnomalyDetectionPipeline.create_anomaly_detection_pipeline(
-            self.config
-        )
-        anomaly_model = anomaly_pipeline.fit(preprocessed_df)
-        
-        # Create metadata
-        metadata = {
-            "creation_date": datetime.now().isoformat(),
-            "config": asdict(self.config),
-            "feature_names": df.columns,
-            "n_samples_trained": df.count(),
-            "preprocessing_stages": len(preprocessing_model.stages),
-            "anomaly_detection_stages": len(anomaly_model.stages)
+        # Check first few rows for consistent data types
+        for idx in range(min(3, len(table_data))):
+            row = table_data.iloc[idx]
+
+            # Header typically has all string values
+            if row.notna().sum() > 0:
+                non_null_values = row.dropna()
+                if len(non_null_values) > 0:
+                    # If row has mostly strings and next row has numbers/different types
+                    string_ratio = sum(isinstance(v, str) for v in non_null_values) / len(non_null_values)
+                    if string_ratio > 0.7:  # 70% strings
+                        return idx
+
+        return 0  # Default to first row
+
+    def extract_value_by_pattern(self, sheet_name: str, 
+                                 cell_value: str = None,
+                                 nearby_offset: Tuple[int, int] = (0, 1)) -> Any:
+        """
+        Extract a specific value based on finding a pattern/label.
+
+        Args:
+            sheet_name: Name of the sheet
+            cell_value: Label to search for
+            nearby_offset: (row_offset, col_offset) from found cell
+
+        Returns:
+            Value at the offset position
+        """
+        ws = self.workbook[sheet_name]
+
+        # Search for the cell with matching value
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value and str(cell.value).strip() == cell_value:
+                    # Found the label, get nearby value
+                    target_row = cell.row + nearby_offset[0]
+                    target_col = cell.column + nearby_offset[1]
+                    return ws.cell(row=target_row, column=target_col).value
+
+        return None
+
+    def get_formulas(self, sheet_name: str) -> Dict[str, str]:
+        """
+        Get all formulas from a sheet (requires data_only=False).
+
+        Args:
+            sheet_name: Name of the sheet
+
+        Returns:
+            Dictionary mapping cell addresses to formulas
+        """
+        if self.data_only:
+            print("Warning: Workbook was loaded with data_only=True. Reload with data_only=False to see formulas.")
+            return {}
+
+        ws = self.workbook[sheet_name]
+        formulas = {}
+
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value and isinstance(cell.value, str) and cell.value.startswith('='):
+                    formulas[cell.coordinate] = cell.value
+
+        return formulas
+
+    def extract_all_tables(self, output_format: str = 'dict') -> Dict[str, List[pd.DataFrame]]:
+        """
+        Extract all tables from all sheets.
+
+        Args:
+            output_format: 'dict', 'csv', or 'json'
+
+        Returns:
+            Dictionary mapping sheet names to list of DataFrames
+        """
+        all_tables = {}
+
+        for sheet_name in self.get_sheet_names():
+            print(f"\nProcessing sheet: {sheet_name}")
+            tables = self.detect_table_boundaries(sheet_name)
+
+            processed_tables = []
+            for i, table_info in enumerate(tables):
+                table_data = table_info['data'].copy()
+
+                # Try to identify header
+                header_row = self.find_header_row(table_data)
+                if header_row is not None and header_row > 0:
+                    # Use identified row as header
+                    table_data.columns = table_data.iloc[header_row]
+                    table_data = table_data.iloc[header_row+1:].reset_index(drop=True)
+
+                # Clean up: remove rows/columns that are all NaN
+                table_data = table_data.dropna(how='all', axis=0).dropna(how='all', axis=1)
+
+                if not table_data.empty:
+                    orientation = self.detect_orientation(table_data)
+                    print(f"  Table {i+1}: {table_data.shape}, orientation: {orientation}, "
+                          f"location: R{table_info['row_start']}C{table_info['col_start']}")
+                    processed_tables.append(table_data)
+
+            all_tables[sheet_name] = processed_tables
+
+        return all_tables
+
+    def save_tables(self, tables: Dict[str, List[pd.DataFrame]], 
+                   output_dir: str = 'extracted_tables'):
+        """
+        Save extracted tables to files.
+
+        Args:
+            tables: Dictionary of tables from extract_all_tables()
+            output_dir: Directory to save tables
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(exist_ok=True)
+
+        for sheet_name, sheet_tables in tables.items():
+            for i, table in enumerate(sheet_tables):
+                # Create safe filename
+                safe_sheet_name = "".join(c if c.isalnum() else "_" for c in sheet_name)
+                filename = f"{safe_sheet_name}_table_{i+1}.csv"
+                filepath = output_path / filename
+
+                table.to_csv(filepath, index=False)
+                print(f"Saved: {filepath}")
+
+
+class TargetedValueExtractor:
+    """Extract specific values from Excel based on labels or patterns."""
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.workbook = load_workbook(file_path, data_only=True)
+
+    def search_by_label(self, label: str, sheet_name: Optional[str] = None,
+                       search_direction: str = 'right') -> List[Dict[str, Any]]:
+        """
+        Search for a label and return nearby values.
+
+        Args:
+            label: Text to search for
+            sheet_name: Specific sheet to search (None = all sheets)
+            search_direction: 'right', 'left', 'below', 'above'
+
+        Returns:
+            List of dictionaries with sheet, location, and value
+        """
+        results = []
+        sheets = [sheet_name] if sheet_name else self.workbook.sheetnames
+
+        direction_offset = {
+            'right': (0, 1),
+            'left': (0, -1),
+            'below': (1, 0),
+            'above': (-1, 0)
         }
-        
-        return preprocessing_model, anomaly_model, metadata
-    
-    def predict(self, df: DataFrame, 
-                preprocessing_model: PipelineModel,
-                anomaly_model: PipelineModel,
-                meta Dict[str, Any]) -> DataFrame:
+
+        offset = direction_offset.get(search_direction, (0, 1))
+
+        for sheet in sheets:
+            ws = self.workbook[sheet]
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value and str(cell.value).strip().lower() == label.lower():
+                        target_row = cell.row + offset[0]
+                        target_col = cell.column + offset[1]
+
+                        if target_row > 0 and target_col > 0:
+                            value = ws.cell(row=target_row, column=target_col).value
+                            results.append({
+                                'sheet': sheet,
+                                'label_location': cell.coordinate,
+                                'value_location': ws.cell(row=target_row, column=target_col).coordinate,
+                                'value': value
+                            })
+
+        return results
+
+    def extract_by_cell_reference(self, references: Dict[str, List[str]]) -> Dict[str, Any]:
         """
-        Predict anomalies using fitted models.
-        
+        Extract specific cells by reference.
+
+        Args:
+            references: Dict mapping sheet names to list of cell references
+
         Returns:
-            DataFrame with anomaly predictions and scores
+            Dictionary of extracted values
         """
-        
-        # Apply preprocessing
-        preprocessed_df = preprocessing_model.transform(df)
-        
-        # Apply anomaly detection
-        anomaly_df = anomaly_model.transform(preprocessed_df)
-        
-        # Get the fitted K-means model for distance calculation
-        kmeans_model = None
-        for stage in anomaly_model.stages:
-            if hasattr(stage, 'clusterCenters'):
-                kmeans_model = stage
-                break
-        
-        if kmeans_model:
-            # Add cluster distance scores
-            anomaly_df = StatelessAnomalyDetectionPipeline.add_cluster_distance_score(
-                anomaly_df, kmeans_model, self.config
-            )
-        
-        # Calculate final ensemble scores
-        result_df = StatelessAnomalyDetectionPipeline.calculate_ensemble_score(
-            anomaly_df, self.config
-        )
-        
-        # Select output columns
-        output_cols = df.columns + [
-            "anomaly_prediction", "ensemble_score", 
-            "cluster_distance", "statistical_score", 
-            "isolation_score", "density_score"
-        ]
-        
-        return result_df.select(*[col for col in output_cols if col in result_df.columns])
+        results = {}
+
+        for sheet_name, cells in references.items():
+            ws = self.workbook[sheet_name]
+            sheet_results = {}
+
+            for cell_ref in cells:
+                try:
+                    value = ws[cell_ref].value
+                    sheet_results[cell_ref] = value
+                except:
+                    sheet_results[cell_ref] = None
+
+            results[sheet_name] = sheet_results
+
+        return results
 
 
-class ModelPersistence:
-    """Utility functions for saving and loading models."""
-    
-    @staticmethod
-    def save_models(preprocessing_model: PipelineModel,
-                   anomaly_model: PipelineModel,
-                   meta Dict[str, Any],
-                   config: AnomalyConfig,
-                   path: str) -> str:
-        """Save all models and metadata."""
-        
-        os.makedirs(path, exist_ok=True)
-        
-        # Save Spark ML models
-        preprocessing_path = os.path.join(path, "preprocessing_model")
-        preprocessing_model.write().overwrite().save(preprocessing_path)
-        
-        anomaly_path = os.path.join(path, "anomaly_model")
-        anomaly_model.write().overwrite().save(anomaly_path)
-        
-        # Save configuration and metadata
-        config_path = os.path.join(path, "config.json")
-        with open(config_path, 'w') as f:
-            json.dump(asdict(config), f, indent=2)
-        
-        metadata_path = os.path.join(path, "metadata.json")
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        print(f"Models saved to: {path}")
-        return path
-    
-    @staticmethod
-    def load_models(path: str) -> Tuple[PipelineModel, PipelineModel, Dict[str, Any], AnomalyConfig]:
-        """Load all models and metadata."""
-        
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Model directory not found: {path}")
-        
-        # Load Spark ML models
-        preprocessing_path = os.path.join(path, "preprocessing_model")
-        preprocessing_model = PipelineModel.load(preprocessing_path)
-        
-        anomaly_path = os.path.join(path, "anomaly_model")
-        anomaly_model = PipelineModel.load(anomaly_path)
-        
-        # Load configuration
-        config_path = os.path.join(path, "config.json")
-        with open(config_path, 'r') as f:
-            config_dict = json.load(f)
-        config = AnomalyConfig(**config_dict)
-        
-        # Load metadata
-        metadata_path = os.path.join(path, "metadata.json")
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-        
-        print(f"Models loaded from: {path}")
-        return preprocessing_model, anomaly_model, metadata, config
+# Example usage functions
+def example_basic_usage():
+    """Example: Extract all tables from an Excel file."""
+
+    # Initialize detector
+    detector = ExcelTableDetector('your_file.xlsx', data_only=True)
+
+    # Extract all tables
+    all_tables = detector.extract_all_tables()
+
+    # Save to CSV files
+    detector.save_tables(all_tables, output_dir='extracted_tables')
+
+    # Access specific table
+    if 'Sheet1' in all_tables and len(all_tables['Sheet1']) > 0:
+        first_table = all_tables['Sheet1'][0]
+        print(first_table.head())
 
 
-# Example usage
+def example_targeted_extraction():
+    """Example: Extract specific values by label."""
+
+    extractor = TargetedValueExtractor('your_file.xlsx')
+
+    # Find value to the right of "Total Sales:"
+    results = extractor.search_by_label('Total Sales:', search_direction='right')
+    for result in results:
+        print(f"Found in {result['sheet']} at {result['value_location']}: {result['value']}")
+
+    # Extract specific cells
+    cell_values = extractor.extract_by_cell_reference({
+        'Sheet1': ['A1', 'B5', 'C10'],
+        'Sheet2': ['D3', 'E7']
+    })
+    print(json.dumps(cell_values, indent=2))
+
+
+def example_formula_handling():
+    """Example: Extract formulas from Excel."""
+
+    # Load with data_only=False to see formulas
+    detector = ExcelTableDetector('your_file.xlsx', data_only=False)
+
+    # Get all formulas from a sheet
+    formulas = detector.get_formulas('Sheet1')
+    for cell, formula in formulas.items():
+        print(f"{cell}: {formula}")
+
+
 if __name__ == "__main__":
-    # Initialize Spark
-    spark = SparkSession.builder \
-        .appName("StatelessAnomalyDetection") \
-        .config("spark.sql.adaptive.enabled", "true") \
-        .getOrCreate()
-    
-    # Create sample data
-    from pyspark.sql.types import StructType, StructField, DoubleType, StringType
-    import numpy as np
-    
-    schema = StructType([
-        StructField("feature1", DoubleType(), True),
-        StructField("feature2", DoubleType(), True),
-        StructField("category", StringType(), True),
-        StructField("feature3", DoubleType(), True)
-    ])
-    
-    # Generate sample data
-    np.random.seed(42)
-    normal_data = [(float(np.random.normal(0, 1)), float(np.random.normal(0, 1)), 
-                   np.random.choice(['A', 'B', 'C']), float(np.random.uniform(-2, 2)))
-                  for _ in range(950)]
-    
-    anomaly_data = [(float(np.random.normal(5, 1)), float(np.random.normal(-5, 1)), 
-                    np.random.choice(['D', 'E']), float(np.random.uniform(5, 10)))
-                   for _ in range(50)]
-    
-    all_data = normal_data + anomaly_data
-    df = spark.createDataFrame(all_data, schema)
-    
-    print("Sample ")
-    df.show(5)
-    
-    # Configure and train detector
-    config = AnomalyConfig(contamination=0.05, n_clusters=8)
-    detector = StatelessAnomalyDetector(config)
-    
-    print("Training anomaly detector...")
-    preprocessing_model, anomaly_model, metadata = detector.fit(df)
-    
-    print("Making predictions...")
-    results = detector.predict(df, preprocessing_model, anomaly_model, metadata)
-    
-    # Show results
-    print("\nSample predictions:")
-    results.select("feature1", "feature2", "category", "anomaly_prediction", "ensemble_score").show(10)
-    
-    # Get summary statistics
-    total_count = results.count()
-    anomaly_count = results.filter(col("anomaly_prediction") == 1).count()
-    anomaly_rate = anomaly_count / total_count
-    
-    print(f"\nAnomaly Detection Summary:")
-    print(f"Total samples: {total_count}")
-    print(f"Anomalies detected: {anomaly_count}")
-    print(f"Anomaly rate: {anomaly_rate:.3f}")
-    
-    # Save models
-    model_path = "./stateless_anomaly_model"
-    ModelPersistence.save_models(
-        preprocessing_model, anomaly_model, metadata, config, model_path
-    )
-    
-    # Load models (demonstration)
-    print("\nLoading saved models...")
-    loaded_preprocessing, loaded_anomaly, loaded_metadata, loaded_config = \
-        ModelPersistence.load_models(model_path)
-    
-    # Test loaded models
-    loaded_detector = StatelessAnomalyDetector(loaded_config)
-    test_results = loaded_detector.predict(
-        df.limit(5), loaded_preprocessing, loaded_anomaly, loaded_metadata
-    )
-    
-    print("Loaded model predictions:")
-    test_results.select("feature1", "category", "anomaly_prediction", "ensemble_score").show()
-    
-    spark.stop()
+    # Basic usage example
+    print("Excel Universal Scraper\n" + "="*50)
+    print("\nTo use this script:")
+    print("1. Install requirements: pip install pandas openpyxl numpy")
+    print("2. Replace 'your_file.xlsx' with your actual file path")
+    print("3. Run the appropriate example function")
+    print("\nAvailable functions:")
+    print("  - example_basic_usage(): Extract all tables")
+    print("  - example_targeted_extraction(): Find specific values")
+    print("  - example_formula_handling(): Extract formulas")
+
+    # Uncomment to run:
+    # example_basic_usage()
+    # example_targeted_extraction()
+    # example_formula_handling()
