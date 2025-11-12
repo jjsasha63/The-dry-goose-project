@@ -1,27 +1,95 @@
 """
-Universal Excel Scraper
-========================
-A robust Python script for extracting data from non-uniform Excel files with:
+Universal Excel Scraper (Enhanced for .xlsm support)
+=====================================================
+A robust Python script for extracting data from non-uniform Excel files (.xlsx, .xlsm) with:
 - Multiple sheets
-- Formulas
+- Formulas (Excel macros supported)
 - Tables in various orientations (horizontal/vertical)
 - Multiple datasets per sheet
 - Tables located anywhere in the sheet
 
 Requirements:
-pip install pandas openpyxl numpy
+pip install pandas openpyxl numpy pyxlsb
 
 Author: Data Engineering Solution
 Date: 2025-11-12
+Version: 2.0 (Enhanced with .xlsm support)
 """
 
 import pandas as pd
 import openpyxl
 from openpyxl import load_workbook
 import numpy as np
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Union
 import json
 from pathlib import Path
+import warnings
+
+
+class ExcelFileHandler:
+    """
+    Utility class to handle different Excel file formats (.xlsx, .xlsm, .xls)
+    """
+
+    SUPPORTED_FORMATS = {'.xlsx', '.xlsm', '.xls'}
+
+    @staticmethod
+    def validate_file(file_path: str) -> bool:
+        """
+        Validate if file exists and has supported extension.
+
+        Args:
+            file_path: Path to Excel file
+
+        Returns:
+            True if valid, False otherwise
+        """
+        path = Path(file_path)
+
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        if path.suffix.lower() not in ExcelFileHandler.SUPPORTED_FORMATS:
+            raise ValueError(
+                f"Unsupported format: {path.suffix}. "
+                f"Supported formats: {ExcelFileHandler.SUPPORTED_FORMATS}"
+            )
+
+        return True
+
+    @staticmethod
+    def get_file_format(file_path: str) -> str:
+        """Get the file format extension."""
+        return Path(file_path).suffix.lower()
+
+    @staticmethod
+    def load_workbook_safe(file_path: str, data_only: bool = True) -> openpyxl.Workbook:
+        """
+        Load workbook handling .xlsm files specially.
+
+        Args:
+            file_path: Path to Excel file
+            data_only: If True, load values; if False, load formulas
+
+        Returns:
+            openpyxl Workbook object
+        """
+        file_format = ExcelFileHandler.get_file_format(file_path)
+
+        try:
+            if file_format == '.xlsm':
+                # For .xlsm files, explicitly set keep_vba to False to avoid macro issues
+                # Macros are not executed, but data is preserved
+                wb = load_workbook(file_path, data_only=data_only, keep_vba=False)
+            else:
+                wb = load_workbook(file_path, data_only=data_only)
+
+            return wb
+
+        except PermissionError:
+            raise PermissionError(f"Permission denied: Cannot open {file_path}. File may be locked.")
+        except Exception as e:
+            raise RuntimeError(f"Error loading workbook: {str(e)}")
 
 
 class ExcelTableDetector:
@@ -32,12 +100,21 @@ class ExcelTableDetector:
         Initialize the Excel scraper.
 
         Args:
-            file_path: Path to the Excel file
+            file_path: Path to the Excel file (.xlsx, .xlsm, .xls)
             data_only: If True, read formula results; if False, read formulas
         """
+        # Validate file
+        ExcelFileHandler.validate_file(file_path)
+
         self.file_path = file_path
+        self.file_format = ExcelFileHandler.get_file_format(file_path)
         self.data_only = data_only
-        self.workbook = load_workbook(file_path, data_only=data_only)
+
+        # Load workbook using safe handler
+        self.workbook = ExcelFileHandler.load_workbook_safe(file_path, data_only=data_only)
+
+        # Print file info
+        print(f"Loaded {self.file_format} file: {Path(file_path).name}")
 
     def get_sheet_names(self) -> List[str]:
         """Get all sheet names in the workbook."""
@@ -56,7 +133,11 @@ class ExcelTableDetector:
             List of dictionaries containing table boundaries and metadata
         """
         # Load sheet with pandas to get all data
-        df = pd.read_excel(self.file_path, sheet_name=sheet_name, header=None)
+        try:
+            df = pd.read_excel(self.file_path, sheet_name=sheet_name, header=None)
+        except Exception as e:
+            print(f"Warning: Could not read sheet {sheet_name}: {str(e)}")
+            return []
 
         # Identify rows and columns with data
         row_has_data = df.notna().sum(axis=1) >= threshold
@@ -226,6 +307,8 @@ class ExcelTableDetector:
         """
         Get all formulas from a sheet (requires data_only=False).
 
+        Note: For .xlsm files, macros are not executed, but data is preserved.
+
         Args:
             sheet_name: Name of the sheet
 
@@ -313,8 +396,12 @@ class TargetedValueExtractor:
     """Extract specific values from Excel based on labels or patterns."""
 
     def __init__(self, file_path: str):
+        # Validate file
+        ExcelFileHandler.validate_file(file_path)
+
         self.file_path = file_path
-        self.workbook = load_workbook(file_path, data_only=True)
+        self.file_format = ExcelFileHandler.get_file_format(file_path)
+        self.workbook = ExcelFileHandler.load_workbook_safe(file_path, data_only=True)
 
     def search_by_label(self, label: str, sheet_name: Optional[str] = None,
                        search_direction: str = 'right') -> List[Dict[str, Any]]:
@@ -342,21 +429,24 @@ class TargetedValueExtractor:
         offset = direction_offset.get(search_direction, (0, 1))
 
         for sheet in sheets:
-            ws = self.workbook[sheet]
-            for row in ws.iter_rows():
-                for cell in row:
-                    if cell.value and str(cell.value).strip().lower() == label.lower():
-                        target_row = cell.row + offset[0]
-                        target_col = cell.column + offset[1]
+            try:
+                ws = self.workbook[sheet]
+                for row in ws.iter_rows():
+                    for cell in row:
+                        if cell.value and str(cell.value).strip().lower() == label.lower():
+                            target_row = cell.row + offset[0]
+                            target_col = cell.column + offset[1]
 
-                        if target_row > 0 and target_col > 0:
-                            value = ws.cell(row=target_row, column=target_col).value
-                            results.append({
-                                'sheet': sheet,
-                                'label_location': cell.coordinate,
-                                'value_location': ws.cell(row=target_row, column=target_col).coordinate,
-                                'value': value
-                            })
+                            if target_row > 0 and target_col > 0:
+                                value = ws.cell(row=target_row, column=target_col).value
+                                results.append({
+                                    'sheet': sheet,
+                                    'label_location': cell.coordinate,
+                                    'value_location': ws.cell(row=target_row, column=target_col).coordinate,
+                                    'value': value
+                                })
+            except Exception as e:
+                print(f"Warning: Error processing sheet {sheet}: {str(e)}")
 
         return results
 
@@ -373,27 +463,31 @@ class TargetedValueExtractor:
         results = {}
 
         for sheet_name, cells in references.items():
-            ws = self.workbook[sheet_name]
-            sheet_results = {}
+            try:
+                ws = self.workbook[sheet_name]
+                sheet_results = {}
 
-            for cell_ref in cells:
-                try:
-                    value = ws[cell_ref].value
-                    sheet_results[cell_ref] = value
-                except:
-                    sheet_results[cell_ref] = None
+                for cell_ref in cells:
+                    try:
+                        value = ws[cell_ref].value
+                        sheet_results[cell_ref] = value
+                    except:
+                        sheet_results[cell_ref] = None
 
-            results[sheet_name] = sheet_results
+                results[sheet_name] = sheet_results
+            except Exception as e:
+                print(f"Warning: Could not access sheet {sheet_name}: {str(e)}")
+                results[sheet_name] = {}
 
         return results
 
 
 # Example usage functions
 def example_basic_usage():
-    """Example: Extract all tables from an Excel file."""
+    """Example: Extract all tables from an Excel file (.xlsx or .xlsm)."""
 
-    # Initialize detector
-    detector = ExcelTableDetector('your_file.xlsx', data_only=True)
+    # Initialize detector (works with .xlsx, .xlsm, .xls)
+    detector = ExcelTableDetector('your_file.xlsm', data_only=True)
 
     # Extract all tables
     all_tables = detector.extract_all_tables()
@@ -407,10 +501,26 @@ def example_basic_usage():
         print(first_table.head())
 
 
-def example_targeted_extraction():
-    """Example: Extract specific values by label."""
+def example_xlsm_with_macros():
+    """Example: Extract data from .xlsm file with macros."""
 
-    extractor = TargetedValueExtractor('your_file.xlsx')
+    print("\nNote: Macros are not executed, but calculated values are extracted.")
+    print("Macros are preserved in the file but not run during data extraction.\n")
+
+    detector = ExcelTableDetector('macro_enabled_file.xlsm', data_only=True)
+
+    # Extract calculated values (macro results if they were run in Excel)
+    all_tables = detector.extract_all_tables()
+
+    # Or get the formulas
+    formulas = detector.get_formulas('Sheet1')
+    print(f"Found {len(formulas)} formulas in Sheet1")
+
+
+def example_targeted_extraction():
+    """Example: Extract specific values by label from .xlsx or .xlsm."""
+
+    extractor = TargetedValueExtractor('your_file.xlsm')
 
     # Find value to the right of "Total Sales:"
     results = extractor.search_by_label('Total Sales:', search_direction='right')
@@ -425,31 +535,44 @@ def example_targeted_extraction():
     print(json.dumps(cell_values, indent=2))
 
 
-def example_formula_handling():
-    """Example: Extract formulas from Excel."""
+def example_batch_processing():
+    """Example: Process multiple Excel files (.xlsx and .xlsm mixed)."""
 
-    # Load with data_only=False to see formulas
-    detector = ExcelTableDetector('your_file.xlsx', data_only=False)
+    from pathlib import Path
 
-    # Get all formulas from a sheet
-    formulas = detector.get_formulas('Sheet1')
-    for cell, formula in formulas.items():
-        print(f"{cell}: {formula}")
+    input_folder = Path('excel_files')
+    output_folder = Path('extracted_data')
+
+    # Process all Excel files regardless of format
+    for excel_file in input_folder.glob('*'):
+        if excel_file.suffix.lower() in {'.xlsx', '.xlsm', '.xls'}:
+            try:
+                print(f"\nProcessing: {excel_file.name}")
+                detector = ExcelTableDetector(str(excel_file))
+                all_tables = detector.extract_all_tables()
+
+                # Create subfolder for this file
+                file_output = output_folder / excel_file.stem
+                detector.save_tables(all_tables, output_dir=str(file_output))
+            except Exception as e:
+                print(f"Error processing {excel_file.name}: {str(e)}")
 
 
 if __name__ == "__main__":
-    # Basic usage example
-    print("Excel Universal Scraper\n" + "="*50)
+    print("Excel Universal Scraper (Enhanced)\n" + "="*50)
+    print("Supported formats: .xlsx, .xlsm, .xls")
     print("\nTo use this script:")
     print("1. Install requirements: pip install pandas openpyxl numpy")
-    print("2. Replace 'your_file.xlsx' with your actual file path")
+    print("2. Replace 'your_file.xlsm' with your actual file path")
     print("3. Run the appropriate example function")
     print("\nAvailable functions:")
     print("  - example_basic_usage(): Extract all tables")
+    print("  - example_xlsm_with_macros(): Handle .xlsm files")
     print("  - example_targeted_extraction(): Find specific values")
-    print("  - example_formula_handling(): Extract formulas")
+    print("  - example_batch_processing(): Process multiple files")
 
     # Uncomment to run:
     # example_basic_usage()
+    # example_xlsm_with_macros()
     # example_targeted_extraction()
-    # example_formula_handling()
+    # example_batch_processing()
