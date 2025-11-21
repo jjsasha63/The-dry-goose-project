@@ -7,28 +7,46 @@ from dataclasses import dataclass, asdict
 import requests
 from collections import defaultdict
 
+import openpyxl.reader.drawings
+import openpyxl.reader.excel
+from openpyxl.reader.drawings import (
+        fromstring,
+        SpreadsheetDrawing,
+        get_rel,
+        get_rels_path,
+        get_dependents,
+        ChartSpace,
+        read_chart,
+        PILImage,
+        IMAGE_NS,
+        Image,
+        BytesIO,
+        warn,
+    )
+
 # ==================== XLSM FILE HANDLER ====================
 
 class ExcelLoader:
-    """Handles xlsm-specific issues like formula caching"""
+    """Handles xlsm-specific issues like formula caching and hidden images"""
     
     @staticmethod
     def load_workbook(file_path: str):
         """
-        Load xlsm/xlsx with proper handling for formulas.
-        xlsm files need data_only=True to read calculated values,
-        but this returns None if Excel hasn't cached the values.
+        Load xlsm/xlsx with proper error handling
         """
-        # Try data_only first for calculated values
         try:
+            if not hasattr(ExcelLoader, '_patched'):
+                openpyxl.reader.drawings.find_images = patched_find_images
+                openpyxl.reader.excel.find_images = patched_find_images
+                ExcelLoader._patched = True
+            
             wb_data = openpyxl.load_workbook(
                 file_path, 
                 data_only=True, 
-                keep_vba=True,  # Critical for xlsm files
+                keep_vba=True,
                 read_only=False
             )
             
-            # Also load with formulas for structure analysis
             wb_formula = openpyxl.load_workbook(
                 file_path,
                 data_only=False,
@@ -41,6 +59,70 @@ class ExcelLoader:
         except Exception as e:
             print(f"Error loading workbook: {e}")
             raise
+
+    def patched_find_images(archive, path):
+        """
+        Patched version that handles hidden images gracefully
+        """
+        src = archive.read(path)
+        tree = fromstring(src)
+        
+        try:
+            drawing = SpreadsheetDrawing.from_tree(tree)
+        except TypeError:
+            warn("DrawingML support incomplete - shapes will be lost.")
+            return [], []
+    
+        rels_path = get_rels_path(path)
+        deps = []
+        if rels_path in archive.namelist():
+            deps = get_dependents(archive, rels_path)
+    
+        # Handle charts
+        charts = []
+        for rel in drawing._chart_rels:
+            try:
+                cs = get_rel(archive, deps, rel.id, ChartSpace)
+                chart = read_chart(cs)
+                chart.anchor = rel.anchor
+                charts.append(chart)
+            except (TypeError, KeyError) as e:
+                warn(f"Unable to read chart {rel.id}: {e}")
+                continue
+    
+        # Handle images with NULL target fix
+        images = []
+        if not PILImage:
+            return charts, images
+    
+        for rel in drawing._blip_rels:
+            try:
+                dep = deps[rel.embed]
+                
+                # CRITICAL FIX: Skip hidden images with NULL target
+                if dep.target == "xl/drawings/NULL":
+                    warn(f"Skipping hidden image with NULL target")
+                    continue
+                    
+                if dep.Type == IMAGE_NS:
+                    try:
+                        image = Image(BytesIO(archive.read(dep.target)))
+                    except (OSError, KeyError) as e:
+                        warn(f"Cannot read image {dep.target}: {e}")
+                        continue
+                        
+                    if image.format.upper() == "WMF":
+                        warn(f"WMF format not supported - skipping")
+                        continue
+                        
+                    image.anchor = rel.anchor
+                    images.append(image)
+            except (KeyError, AttributeError) as e:
+                warn(f"Error processing image: {e}")
+                continue
+                
+        return charts, images
+
 
 # ==================== TABLE DETECTION ====================
 
