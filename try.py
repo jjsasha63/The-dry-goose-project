@@ -612,7 +612,41 @@ class TableDetector:
         
         # Preload the entire table region
         self._preload_region(
-            start_row, table.max
+            start_row, table.max_row,
+            table.min_col, table.max_col
+        )
+        
+        for row in range(start_row, table.max_row + 1):
+            row_data = []
+            for col in range(table.min_col, table.max_col + 1):
+                cell = self._get_cell_safe(row, col)
+                value = cell.value if cell else None
+                row_data.append(value)
+            data.append(row_data)
+        
+        return data
+
+    def clear_cache(self):
+        """Clear the cell cache to free memory"""
+        self._cell_cache.clear()
+    
+    def print_table_summary(self, tables: List[TableRegion]):
+        """Print a human-readable summary of detected tables"""
+        print("\n" + "="*60)
+        print(f"TABLE DETECTION SUMMARY")
+        print("="*60)
+        
+        for idx, table in enumerate(tables):
+            print(f"\nTable {idx}:")
+            print(f"  Location: {get_column_letter(table.min_col)}{table.min_row} "
+                  f"to {get_column_letter(table.max_col)}{table.max_row}")
+            print(f"  Dimensions: {table.max_row - table.min_row + 1} rows × "
+                  f"{table.max_col - table.min_col + 1} columns")
+            print(f"  Orientation: {table.orientation}")
+            print(f"  Headers: {', '.join(table.headers[:5])}"
+                  f"{' ...' if len(table.headers) > 5 else ''}")
+        
+        print("\n" + "="*60)
 
 # ==================== STRUCTURE TO METADATA ====================
 
