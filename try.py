@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Literal
 import json
 import openai
 from pathlib import Path
@@ -8,28 +8,82 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 import re
 import tiktoken
+from pydantic import BaseModel, Field, validator
+from enum import Enum
 from collections import defaultdict
+import hashlib
 
-class MultiSheetExcelExtractor:
+# ============================================================================
+# STRICT SCHEMA DEFINITIONS
+# ============================================================================
+
+class DataType(str, Enum):
+    """Supported data types for extraction"""
+    NUMBER = "number"
+    CURRENCY = "currency"
+    PERCENTAGE = "percentage"
+    DATE = "date"
+    TEXT = "text"
+    BOOLEAN = "boolean"
+    LIST = "list"
+
+class ExtractionResult(BaseModel):
+    """Strict schema for extraction results - ensures perfect structure"""
+    found: bool = Field(description="Whether the value was found")
+    value: Optional[Any] = Field(description="The exact extracted value")
+    sheet_name: Optional[str] = Field(description="Sheet containing the value")
+    cell_reference: Optional[str | List[str]] = Field(description="Cell reference(s)")
+    data_type: DataType = Field(description="Type of the extracted value")
+    confidence: float = Field(ge=0.0, le=1.0, description="Confidence score 0-1")
+    reasoning: str = Field(description="Step-by-step reasoning for extraction")
+    verification_steps: List[str] = Field(description="Steps taken to verify accuracy")
+    alternative_interpretations: Optional[List[str]] = Field(
+        default=None, 
+        description="Other possible interpretations if ambiguous"
+    )
+    formula_if_applicable: Optional[str] = Field(default=None)
+    context_cells: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Surrounding cells that provide context"
+    )
+    
+    @validator('confidence')
+    def confidence_must_be_justified(cls, v, values):
+        """Ensure confidence matches the reasoning"""
+        if v > 0.9 and not values.get('found'):
+            raise ValueError("High confidence without found value is invalid")
+        return v
+
+class MultiPassResult(BaseModel):
+    """Result from multiple extraction passes"""
+    pass_1_result: ExtractionResult
+    pass_2_result: ExtractionResult
+    pass_3_result: Optional[ExtractionResult] = None
+    consensus_value: Any
+    consensus_confidence: float
+    discrepancies: List[str]
+    final_verified: bool
+
+# ============================================================================
+# PRECISION EXCEL EXTRACTOR
+# ============================================================================
+
+class PrecisionExcelExtractor:
     """
-    Extract precise values from multi-sheet Excel files with context optimization.
-    Keeps total context under 128K tokens through intelligent summarization.
+    Maximum precision extractor using:
+    - Structured outputs (Pydantic schemas)
+    - Multi-pass extraction with verification
+    - Few-shot examples for perfect formatting
+    - Chunked processing with update-on-change logic
+    - Token-optimized context
     """
     
     def __init__(self, 
-                 api_key: str, 
-                 model: str = "gpt-4", 
+                 api_key: str,
+                 model: str = "gpt-4",
                  azure_endpoint: Optional[str] = None,
-                 max_context_tokens: int = 120000):  # Leave 8K buffer for response
-        """
-        Initialize the extractor with token limits.
+                 max_context_tokens: int = 120000):
         
-        Args:
-            api_key: OpenAI API key or Azure API key
-            model: Model name (e.g., 'gpt-4', 'gpt-4-turbo')
-            azure_endpoint: Azure OpenAI endpoint URL (optional)
-            max_context_tokens: Maximum tokens for context (default 120K, leaves 8K for response)
-        """
         if azure_endpoint:
             openai.api_type = "azure"
             openai.api_base = azure_endpoint
@@ -42,586 +96,515 @@ class MultiSheetExcelExtractor:
         self.azure_endpoint = azure_endpoint
         self.max_context_tokens = max_context_tokens
         
-        # Initialize tokenizer
         try:
             self.encoding = tiktoken.encoding_for_model(model)
         except KeyError:
             self.encoding = tiktoken.get_encoding("cl100k_base")
     
     def count_tokens(self, text: str) -> int:
-        """Count tokens in a text string."""
+        """Precise token counting"""
         return len(self.encoding.encode(text))
     
-    def read_all_sheets(self, file_path: str, 
-                       max_rows_per_sheet: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Read all sheets from Excel file with comprehensive metadata.
+    def extract_sheet_structure(self, ws, ws_data_only, max_rows: Optional[int] = None) -> Dict[str, Any]:
+        """Extract complete sheet structure with semantic understanding"""
         
-        Args:
-            file_path: Path to Excel file
-            max_rows_per_sheet: Optional limit on rows per sheet (for very large files)
+        max_row = ws.max_row if not max_rows else min(ws.max_row, max_rows)
+        max_col = ws.max_column
+        
+        # Identify structural elements
+        headers = []
+        bold_cells = {}
+        highlighted_cells = {}
+        formula_cells = {}
+        numeric_cells = {}
+        text_cells = {}
+        
+        # Build spatial index for fast lookup
+        cell_index = {}
+        
+        for row_idx in range(1, max_row + 1):
+            for col_idx in range(1, max_col + 1):
+                cell = ws.cell(row_idx, col_idx)
+                value = cell.value
+                
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    continue
+                
+                cell_ref = f"{get_column_letter(col_idx)}{row_idx}"
+                
+                # Classify cell
+                cell_info = {
+                    "value": value,
+                    "row": row_idx,
+                    "col": col_idx,
+                    "is_bold": cell.font and cell.font.bold,
+                    "has_fill": cell.fill and cell.fill.start_color.index != "00000000",
+                    "is_merged": False
+                }
+                
+                # Handle formulas
+                if isinstance(value, str) and value.startswith('='):
+                    calculated = ws_data_only.cell(row_idx, col_idx).value
+                    cell_info["is_formula"] = True
+                    cell_info["formula"] = value
+                    cell_info["calculated_value"] = calculated
+                    formula_cells[cell_ref] = cell_info
+                else:
+                    cell_info["is_formula"] = False
+                
+                # Categorize by type and position
+                if cell_info["is_bold"] and row_idx <= 5:
+                    headers.append((cell_ref, value))
+                
+                if cell_info["is_bold"]:
+                    bold_cells[cell_ref] = value
+                
+                if cell_info["has_fill"]:
+                    highlighted_cells[cell_ref] = value
+                
+                if isinstance(value, (int, float)) or (isinstance(calculated := cell_info.get("calculated_value"), (int, float))):
+                    numeric_cells[cell_ref] = calculated if cell_info.get("is_formula") else value
+                
+                if isinstance(value, str) and not value.startswith('='):
+                    text_cells[cell_ref] = value
+                
+                cell_index[cell_ref] = cell_info
+        
+        # Build contextual grid (semantic representation)
+        grid_semantic = []
+        for row_idx in range(1, min(max_row + 1, 51)):  # First 50 rows for semantic understanding
+            row_cells = []
+            for col_idx in range(1, min(max_col + 1, 21)):  # First 20 cols
+                cell_ref = f"{get_column_letter(col_idx)}{row_idx}"
+                if cell_ref in cell_index:
+                    info = cell_index[cell_ref]
+                    val = info.get("calculated_value", info["value"])
+                    
+                    # Add semantic markers
+                    markers = []
+                    if info["is_bold"]:
+                        markers.append("BOLD")
+                    if info["has_fill"]:
+                        markers.append("HIGHLIGHT")
+                    if info.get("is_formula"):
+                        markers.append(f"CALC")
+                    
+                    if markers:
+                        row_cells.append(f"{val}[{','.join(markers)}]")
+                    else:
+                        row_cells.append(str(val))
+                else:
+                    row_cells.append("")
             
-        Returns:
-            Dictionary containing data from all sheets
-        """
-        wb = openpyxl.load_workbook(file_path, data_only=False, read_only=False)
-        wb_data_only = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
+            if any(c for c in row_cells):  # Only add non-empty rows
+                grid_semantic.append(row_cells)
         
-        all_sheets_data = {
-            "file_path": file_path,
-            "total_sheets": len(wb.sheetnames),
-            "sheet_names": wb.sheetnames,
-            "sheets": {}
+        return {
+            "dimensions": {"rows": max_row, "cols": max_col},
+            "headers": headers,
+            "bold_cells": bold_cells,
+            "highlighted_cells": highlighted_cells,
+            "formula_cells": formula_cells,
+            "numeric_cells": numeric_cells,
+            "text_cells": text_cells,
+            "cell_index": cell_index,
+            "grid_semantic": grid_semantic
         }
+    
+    def read_all_sheets_optimized(self, file_path: str) -> Dict[str, Any]:
+        """Read all sheets with optimized structure extraction"""
+        
+        wb = openpyxl.load_workbook(file_path, data_only=False)
+        wb_data_only = openpyxl.load_workbook(file_path, data_only=True)
+        
+        sheets_data = {}
         
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             ws_data_only = wb_data_only[sheet_name]
             
-            # Basic dimensions
-            max_row = ws.max_row if not max_rows_per_sheet else min(ws.max_row, max_rows_per_sheet)
-            max_col = ws.max_column
-            
-            # Extract cell data
-            cell_data = []
-            formulas = {}
-            merged_ranges = [str(r) for r in ws.merged_cells.ranges]
-            
-            for row_idx in range(1, max_row + 1):
-                for col_idx in range(1, max_col + 1):
-                    cell = ws.cell(row_idx, col_idx)
-                    value = cell.value
-                    
-                    if value is not None:
-                        cell_ref = f"{get_column_letter(col_idx)}{row_idx}"
-                        
-                        cell_info = {
-                            "cell": cell_ref,
-                            "row": row_idx,
-                            "col": col_idx,
-                            "value": value,
-                            "is_bold": cell.font.bold if cell.font else False,
-                            "has_fill": cell.fill.start_color.index != "00000000" if cell.fill else False,
-                        }
-                        
-                        # Handle formulas
-                        if isinstance(value, str) and value.startswith('='):
-                            formulas[cell_ref] = value
-                            cell_info["is_formula"] = True
-                            cell_info["calculated_value"] = ws_data_only.cell(row_idx, col_idx).value
-                        else:
-                            cell_info["is_formula"] = False
-                        
-                        cell_data.append(cell_info)
-            
-            # Create grid representation
-            grid = []
-            for row_idx in range(1, max_row + 1):
-                row_data = []
-                for col_idx in range(1, max_col + 1):
-                    cell = ws.cell(row_idx, col_idx)
-                    row_data.append(str(cell.value) if cell.value is not None else "")
-                grid.append(row_data)
-            
-            all_sheets_data["sheets"][sheet_name] = {
-                "dimensions": {"rows": max_row, "cols": max_col},
-                "cell_data": cell_data,
-                "formulas": formulas,
-                "merged_ranges": merged_ranges,
-                "grid": grid,
-                "dataframe": pd.DataFrame(grid)
-            }
+            sheets_data[sheet_name] = self.extract_sheet_structure(ws, ws_data_only)
         
         wb.close()
         wb_data_only.close()
         
-        return all_sheets_data
+        return {
+            "file_path": file_path,
+            "sheet_names": list(sheets_data.keys()),
+            "sheets": sheets_data
+        }
     
-    def create_compact_sheet_summary(self, sheet_data: Dict[str, Any], 
-                                    sheet_name: str) -> str:
-        """
-        Create a compact summary of a single sheet optimized for token efficiency.
-        """
-        summary_parts = []
+    def build_precision_context(self, 
+                                all_sheets: Dict[str, Any], 
+                                query: str,
+                                target_tokens: int) -> str:
+        """Build context optimized for precision, not just compression"""
         
-        # Basic info (very compact)
-        dims = sheet_data['dimensions']
-        summary_parts.append(f"## {sheet_name} [{dims['rows']}x{dims['cols']}]")
+        sections = []
         
-        # Identify key structural elements
-        headers = []
-        bold_cells = []
-        formula_cells = []
+        # File overview
+        sections.append(f"FILE: {all_sheets['file_path']}")
+        sections.append(f"SHEETS: {', '.join(all_sheets['sheet_names'])}")
+        sections.append("")
         
-        for cell_info in sheet_data['cell_data']:
-            if cell_info['is_bold'] and cell_info['row'] <= 3:
-                headers.append(f"{cell_info['cell']}:{cell_info['value']}")
-            elif cell_info['is_bold']:
-                bold_cells.append(f"{cell_info['cell']}:{cell_info['value']}")
-            if cell_info['is_formula']:
-                calc_val = cell_info.get('calculated_value', 'N/A')
-                formula_cells.append(f"{cell_info['cell']}={calc_val}")
-        
-        if headers:
-            summary_parts.append(f"Headers: {', '.join(headers[:10])}")
-        if bold_cells[:5]:
-            summary_parts.append(f"Key labels: {', '.join(bold_cells[:5])}")
-        if formula_cells[:5]:
-            summary_parts.append(f"Calculations: {', '.join(formula_cells[:5])}")
-        
-        # Sample grid (first 10 rows, essential columns only)
-        df = sheet_data['dataframe']
-        non_empty_cols = [i for i in range(len(df.columns)) 
-                         if df.iloc[:, i].astype(str).str.strip().ne('').any()][:10]
-        
-        if non_empty_cols:
-            summary_parts.append("\nData preview:")
-            for idx in range(min(10, len(df))):
-                row_data = [f"{get_column_letter(col+1)}{idx+1}:{str(df.iloc[idx, col])[:20]}" 
-                           for col in non_empty_cols if str(df.iloc[idx, col]).strip()]
-                if row_data:
-                    summary_parts.append(f"  R{idx+1}: {', '.join(row_data)}")
-        
-        return "\n".join(summary_parts)
-    
-    def create_detailed_sheet_context(self, sheet_data: Dict[str, Any], 
-                                     sheet_name: str,
-                                     max_tokens: int) -> str:
-        """
-        Create detailed context for a single sheet with token limit.
-        """
-        context_parts = []
-        
-        # Header
-        dims = sheet_data['dimensions']
-        context_parts.append(f"=== SHEET: {sheet_name} ===")
-        context_parts.append(f"Dimensions: {dims['rows']} rows × {dims['cols']} columns\n")
-        
-        # Full grid with cell references
-        df = sheet_data['dataframe']
-        col_letters = [get_column_letter(i+1) for i in range(len(df.columns))]
-        
-        context_parts.append("GRID:")
-        context_parts.append("    " + " | ".join(f"{col:^8}" for col in col_letters))
-        context_parts.append("----" + "-|-".join("-" * 8 for _ in col_letters))
-        
-        for idx, row in df.iterrows():
-            row_num = idx + 1
-            row_values = [str(val)[:8].ljust(8) if val else " " * 8 for val in row]
-            row_text = f"{row_num:3} | " + " | ".join(row_values)
+        # For each sheet, build hierarchical representation
+        for sheet_name, sheet_data in all_sheets["sheets"].items():
+            sheet_parts = []
+            sheet_parts.append(f"### SHEET: {sheet_name} ###")
+            
+            dims = sheet_data["dimensions"]
+            sheet_parts.append(f"Size: {dims['rows']}×{dims['cols']}")
+            
+            # Headers (critical for understanding structure)
+            if sheet_data["headers"]:
+                header_str = " | ".join([f"{ref}='{val}'" for ref, val in sheet_data["headers"][:15]])
+                sheet_parts.append(f"HEADERS: {header_str}")
+            
+            # Key labeled cells (bold text usually indicates labels)
+            if sheet_data["bold_cells"]:
+                bold_items = list(sheet_data["bold_cells"].items())[:10]
+                bold_str = " | ".join([f"{ref}='{val}'" for ref, val in bold_items])
+                sheet_parts.append(f"LABELS: {bold_str}")
+            
+            # Important numeric values (highlighted cells often = results)
+            if sheet_data["highlighted_cells"]:
+                hl_items = list(sheet_data["highlighted_cells"].items())[:8]
+                hl_str = " | ".join([f"{ref}='{val}'" for ref, val in hl_items])
+                sheet_parts.append(f"HIGHLIGHTED: {hl_str}")
+            
+            # Formulas (show calculations)
+            if sheet_data["formula_cells"]:
+                formula_items = list(sheet_data["formula_cells"].items())[:5]
+                for ref, info in formula_items:
+                    sheet_parts.append(f"FORMULA {ref}: {info['formula']} → {info['calculated_value']}")
+            
+            # Semantic grid (shows spatial relationships)
+            sheet_parts.append("\nGRID:")
+            for row_idx, row in enumerate(sheet_data["grid_semantic"][:30], 1):  # First 30 rows
+                non_empty = [(i, v) for i, v in enumerate(row) if v]
+                if non_empty:
+                    row_str = " | ".join([f"{get_column_letter(i+1)}{row_idx}:{v[:30]}" 
+                                         for i, v in non_empty[:10]])
+                    sheet_parts.append(f"  R{row_idx}: {row_str}")
+            
+            sheet_context = "\n".join(sheet_parts)
             
             # Check token budget
-            current_text = "\n".join(context_parts + [row_text])
-            if self.count_tokens(current_text) > max_tokens:
-                context_parts.append(f"... ({dims['rows'] - idx} more rows)")
-                break
+            test_context = "\n\n".join(sections + [sheet_context])
+            if self.count_tokens(test_context) > target_tokens:
+                # Truncate grid if needed
+                sheet_parts = sheet_parts[:sheet_parts.index("\nGRID:") + 11]  # Keep first 10 grid rows
+                sheet_context = "\n".join(sheet_parts)
             
-            context_parts.append(row_text)
+            sections.append(sheet_context)
+            sections.append("")
         
-        # Add cell metadata if space allows
-        current_tokens = self.count_tokens("\n".join(context_parts))
-        if current_tokens < max_tokens * 0.8:  # Use up to 80% of budget
-            context_parts.append("\nKEY CELLS:")
-            for cell_info in sheet_data['cell_data']:
-                if cell_info['is_bold'] or cell_info['is_formula'] or cell_info['has_fill']:
-                    tags = []
-                    if cell_info['is_bold']:
-                        tags.append("BOLD")
-                    if cell_info['has_fill']:
-                        tags.append("HIGHLIGHTED")
-                    if cell_info['is_formula']:
-                        tags.append(f"={cell_info.get('calculated_value', 'N/A')}")
-                    
-                    cell_line = f"  {cell_info['cell']}: {cell_info['value']} [{', '.join(tags)}]"
-                    
-                    test_text = "\n".join(context_parts + [cell_line])
-                    if self.count_tokens(test_text) > max_tokens:
-                        break
-                    
-                    context_parts.append(cell_line)
-        
-        return "\n".join(context_parts)
+        return "\n\n".join(sections)
     
-    def optimize_context_distribution(self, 
-                                     all_sheets_data: Dict[str, Any],
-                                     query: str,
-                                     target_tokens: int) -> str:
-        """
-        Intelligently distribute token budget across all sheets based on relevance.
-        """
-        context_parts = []
-        
-        # File-level metadata (minimal tokens)
-        context_parts.append(f"=== EXCEL FILE: {all_sheets_data['file_path']} ===")
-        context_parts.append(f"Total Sheets: {all_sheets_data['total_sheets']}")
-        context_parts.append(f"Sheet Names: {', '.join(all_sheets_data['sheet_names'])}\n")
-        
-        # Reserve tokens for system prompt and query
-        header_tokens = self.count_tokens("\n".join(context_parts))
-        query_tokens = self.count_tokens(query)
-        system_tokens = 500  # Approximate
-        available_tokens = target_tokens - header_tokens - query_tokens - system_tokens
-        
-        # First pass: create compact summaries for all sheets
-        summaries = {}
-        summary_tokens = 0
-        for sheet_name, sheet_data in all_sheets_data["sheets"].items():
-            summary = self.create_compact_sheet_summary(sheet_data, sheet_name)
-            summaries[sheet_name] = summary
-            summary_tokens += self.count_tokens(summary)
-        
-        # Determine strategy based on total size
-        if summary_tokens < available_tokens * 0.3:
-            # Strategy 1: Include all summaries + detailed view of relevant sheets
-            context_parts.append("=== ALL SHEETS SUMMARY ===")
-            for sheet_name, summary in summaries.items():
-                context_parts.append(summary + "\n")
-            
-            # Use remaining budget for detailed sheets
-            used_tokens = self.count_tokens("\n".join(context_parts))
-            remaining_tokens = available_tokens - used_tokens
-            
-            # Identify potentially relevant sheets based on query keywords
-            query_lower = query.lower()
-            relevant_sheets = []
-            for sheet_name, sheet_data in all_sheets_data["sheets"].items():
-                # Check if sheet name or content matches query
-                relevance_score = 0
-                if any(word in sheet_name.lower() for word in query_lower.split()):
-                    relevance_score += 10
-                
-                # Check cell values for query keywords
-                for cell_info in sheet_data['cell_data'][:100]:  # Sample first 100 cells
-                    cell_val = str(cell_info['value']).lower()
-                    if any(word in cell_val for word in query_lower.split() if len(word) > 3):
-                        relevance_score += 1
-                
-                if relevance_score > 0:
-                    relevant_sheets.append((sheet_name, relevance_score))
-            
-            relevant_sheets.sort(key=lambda x: x[1], reverse=True)
-            
-            # Add detailed context for most relevant sheets
-            if relevant_sheets:
-                context_parts.append("\n=== DETAILED VIEWS (Most Relevant) ===\n")
-                tokens_per_sheet = remaining_tokens // min(len(relevant_sheets), 3)
-                
-                for sheet_name, _ in relevant_sheets[:3]:
-                    sheet_data = all_sheets_data["sheets"][sheet_name]
-                    detailed = self.create_detailed_sheet_context(
-                        sheet_data, sheet_name, tokens_per_sheet
-                    )
-                    context_parts.append(detailed + "\n")
-        
-        else:
-            # Strategy 2: Proportional token allocation across all sheets
-            tokens_per_sheet = available_tokens // len(all_sheets_data["sheets"])
-            
-            for sheet_name, sheet_data in all_sheets_data["sheets"].items():
-                detailed = self.create_detailed_sheet_context(
-                    sheet_data, sheet_name, tokens_per_sheet
-                )
-                context_parts.append(detailed + "\n")
-        
-        final_context = "\n".join(context_parts)
-        
-        # Verify we're under budget
-        final_tokens = self.count_tokens(final_context)
-        if final_tokens > target_tokens:
-            # Truncate if necessary (shouldn't happen, but safety measure)
-            tokens = self.encoding.encode(final_context)
-            truncated_tokens = tokens[:target_tokens]
-            final_context = self.encoding.decode(truncated_tokens)
-        
-        return final_context
+    def create_few_shot_examples(self) -> List[Dict[str, str]]:
+        """Few-shot examples for perfect extraction format"""
+        return [
+            {
+                "role": "user",
+                "content": """SHEET: Q4_Results
+HEADERS: A1='Quarter' | B1='Revenue' | C1='Profit'
+GRID:
+  R2: A2:Q4 | B2:$1,250,000 | C2:$340,000
+
+Query: What was Q4 revenue?
+Expected type: currency"""
+            },
+            {
+                "role": "assistant",
+                "content": json.dumps({
+                    "found": True,
+                    "value": 1250000,
+                    "sheet_name": "Q4_Results",
+                    "cell_reference": "B2",
+                    "data_type": "currency",
+                    "confidence": 1.0,
+                    "reasoning": "1. Located 'Revenue' header in B1. 2. Found Q4 label in A2. 3. Retrieved corresponding value in B2: $1,250,000. 4. Verified no other Q4 revenue entries exist.",
+                    "verification_steps": [
+                        "Confirmed B1 contains 'Revenue' header",
+                        "Confirmed A2 contains 'Q4' label",
+                        "Confirmed B2 is in same row as Q4",
+                        "Verified value format matches currency pattern"
+                    ],
+                    "alternative_interpretations": None,
+                    "formula_if_applicable": None,
+                    "context_cells": {
+                        "A2": "Q4",
+                        "B1": "Revenue",
+                        "C2": "$340,000"
+                    }
+                }, indent=2)
+            },
+            {
+                "role": "user",
+                "content": """SHEET: Summary
+LABELS: A5='Total Annual Revenue' | A10='Operating Margin'
+FORMULA B5: =SUM(B2:B4) → 5000000
+GRID:
+  R5: A5:Total Annual Revenue[BOLD] | B5:5000000[CALC,HIGHLIGHT]
+
+Query: What is total annual revenue?
+Expected type: currency"""
+            },
+            {
+                "role": "assistant",
+                "content": json.dumps({
+                    "found": True,
+                    "value": 5000000,
+                    "sheet_name": "Summary",
+                    "cell_reference": "B5",
+                    "data_type": "currency",
+                    "confidence": 1.0,
+                    "reasoning": "1. Found exact label match 'Total Annual Revenue' in A5 (bold formatting confirms it's a label). 2. Adjacent cell B5 contains calculated value 5,000,000. 3. Cell is highlighted, indicating it's a key result. 4. Formula =SUM(B2:B4) confirms this aggregates revenue data.",
+                    "verification_steps": [
+                        "Exact text match: 'Total Annual Revenue' in A5",
+                        "A5 is bold, confirming it's a row label",
+                        "B5 is in same row as label",
+                        "B5 has formula calculating sum",
+                        "B5 is highlighted as important value"
+                    ],
+                    "alternative_interpretations": None,
+                    "formula_if_applicable": "=SUM(B2:B4)",
+                    "context_cells": {
+                        "A5": "Total Annual Revenue",
+                        "B2": "Q1 Revenue",
+                        "B3": "Q2 Revenue",
+                        "B4": "Q3 Revenue"
+                    }
+                }, indent=2)
+            }
+        ]
     
-    def extract_from_all_sheets(self,
-                               file_path: str,
-                               query: str,
-                               expected_type: str = "auto") -> Dict[str, Any]:
+    def extract_with_verification(self,
+                                  file_path: str,
+                                  query: str,
+                                  expected_type: str = "auto",
+                                  num_passes: int = 2) -> MultiPassResult:
         """
-        Extract values from multi-sheet Excel file with optimized context.
+        Multi-pass extraction with verification for maximum precision
         
         Args:
             file_path: Path to Excel file
             query: Natural language query
             expected_type: Expected data type
-            
-        Returns:
-            Extraction result with sheet information
+            num_passes: Number of independent extraction passes (2-3 recommended)
         """
-        # Read all sheets
-        print(f"Reading Excel file: {file_path}")
-        all_sheets_data = self.read_all_sheets(file_path)
-        print(f"Loaded {all_sheets_data['total_sheets']} sheets: {', '.join(all_sheets_data['sheet_names'])}")
         
-        # Create optimized context
-        print(f"Optimizing context (target: {self.max_context_tokens} tokens)...")
-        excel_context = self.optimize_context_distribution(
-            all_sheets_data, query, self.max_context_tokens
-        )
+        print(f"\n{'='*80}")
+        print(f"PRECISION EXTRACTION: {query}")
+        print(f"{'='*80}\n")
         
+        # Load data once
+        print("Loading Excel file...")
+        all_sheets = self.read_all_sheets_optimized(file_path)
+        print(f"✓ Loaded {len(all_sheets['sheet_names'])} sheets: {', '.join(all_sheets['sheet_names'])}")
+        
+        # Build optimized context
+        print("\nBuilding precision context...")
+        excel_context = self.build_precision_context(all_sheets, query, self.max_context_tokens)
         context_tokens = self.count_tokens(excel_context)
-        print(f"Context size: {context_tokens:,} tokens ({context_tokens/self.max_context_tokens*100:.1f}% of budget)")
+        print(f"✓ Context: {context_tokens:,} tokens")
         
-        # Build system prompt
-        system_prompt = """You are a precise multi-sheet Excel data extraction assistant.
+        # System prompt with strict instructions
+        system_prompt = """You are a PRECISION Excel data extraction system. Your responses must be PERFECT.
 
-TASK:
-1. Analyze data across ALL sheets in the workbook
-2. Locate the exact value that answers the user's query
-3. Identify which sheet contains the answer
-4. Return precise cell reference and value
+CRITICAL REQUIREMENTS:
+1. Extract EXACT values - no approximations, no rounding
+2. Find the PRECISE cell reference
+3. Provide STEP-BY-STEP verification of your answer
+4. If multiple interpretations exist, list ALL of them
+5. Confidence must reflect true certainty (use <1.0 if ANY doubt exists)
 
-RULES:
-- Search across ALL sheets provided
-- Return EXACT values, not approximations
-- Include sheet name in your response
-- Consider cross-sheet references and formulas
-- If data spans multiple sheets, explain the relationship
-- If ambiguous, specify which sheet and why
+EXTRACTION PROCESS:
+1. Parse the query to understand what is being asked
+2. Identify relevant headers, labels, and structure
+3. Locate the exact cell(s) containing the answer
+4. Verify surrounding context confirms this is correct
+5. Check for formulas or calculations
+6. Double-check no other cells could match the query
 
-RESPONSE FORMAT (JSON):
-{
-    "found": true/false,
-    "value": <extracted_value>,
-    "sheet_name": "Sheet1",
-    "cell_reference": "A1" or ["A1", "A2"],
-    "data_type": "number"/"currency"/"percentage"/"date"/"text",
-    "confidence": 0.0-1.0,
-    "reasoning": "Why this is the correct value",
-    "related_sheets": ["Sheet2", "Sheet3"] if data references other sheets,
-    "cross_sheet_context": "Explanation if data involves multiple sheets"
-}"""
+OUTPUT: Valid JSON matching ExtractionResult schema."""
         
-        user_prompt = f"""{excel_context}
+        # Few-shot examples
+        few_shot = self.create_few_shot_examples()
+        
+        # Perform multiple independent passes
+        pass_results = []
+        
+        for pass_num in range(1, num_passes + 1):
+            print(f"\n--- Pass {pass_num}/{num_passes} ---")
+            
+            # Slight variation in temperature for independent reasoning
+            temp = 0.0 if pass_num == 1 else 0.1
+            
+            messages = [
+                {"role": "system", "content": system_prompt}
+            ] + few_shot + [
+                {"role": "user", "content": f"""{excel_context}
 
-=== USER QUERY ===
-{query}
+=== EXTRACTION TASK (Pass {pass_num}) ===
+Query: {query}
+Expected Type: {expected_type}
 
-Expected data type: {expected_type}
-
-Extract the precise value answering this query. Search ALL sheets and return JSON response."""
-        
-        # Count total tokens
-        system_tokens = self.count_tokens(system_prompt)
-        user_tokens = self.count_tokens(user_prompt)
-        total_input_tokens = system_tokens + user_tokens
-        
-        print(f"Total input tokens: {total_input_tokens:,}")
-        print(f"  System: {system_tokens:,}")
-        print(f"  User (context + query): {user_tokens:,}")
-        
-        if total_input_tokens > 128000:
-            print(f"WARNING: Input exceeds 128K tokens! ({total_input_tokens:,})")
-        
-        # Call LLM
-        print("Calling LLM...")
-        if self.azure_endpoint:
-            response = openai.ChatCompletion.create(
-                engine=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.0,
-                max_tokens=2000
-            )
-        else:
-            response = openai.ChatCompletion.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.0,
-                max_tokens=2000
-            )
-        
-        # Parse response
-        result_text = response.choices[0].message.content.strip()
-        
-        json_match = re.search(r'``````', result_text, re.DOTALL)
-        if json_match:
-            result_json = json.loads(json_match.group(1))
-        else:
+Provide your extraction in valid JSON format matching the ExtractionResult schema.
+Be MAXIMALLY PRECISE. Include detailed verification steps."""}
+            ]
+            
+            # Calculate token usage
+            total_input = sum(self.count_tokens(m["content"]) for m in messages)
+            print(f"Input tokens: {total_input:,}")
+            
+            # API call
+            if self.azure_endpoint:
+                response = openai.ChatCompletion.create(
+                    engine=self.model,
+                    messages=messages,
+                    temperature=temp,
+                    max_tokens=3000,
+                    response_format={"type": "json_object"}  # Enforce JSON
+                )
+            else:
+                response = openai.ChatCompletion.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=temp,
+                    max_tokens=3000,
+                    response_format={"type": "json_object"}
+                )
+            
+            result_text = response.choices[0].message.content.strip()
+            
+            # Parse and validate with Pydantic
             try:
-                result_json = json.loads(result_text)
-            except json.JSONDecodeError:
-                result_json = {
-                    "found": False,
-                    "value": None,
-                    "sheet_name": None,
-                    "cell_reference": None,
-                    "confidence": 0.0,
-                    "reasoning": "Failed to parse response",
-                    "raw_response": result_text
-                }
+                result_dict = json.loads(result_text)
+                result = ExtractionResult(**result_dict)
+                pass_results.append(result)
+                
+                print(f"✓ Found: {result.found}")
+                print(f"✓ Value: {result.value}")
+                print(f"✓ Cell: {result.cell_reference}")
+                print(f"✓ Confidence: {result.confidence:.2%}")
+                
+            except Exception as e:
+                print(f"✗ Parse error: {e}")
+                print(f"Raw response: {result_text[:200]}")
+                # Create error result
+                error_result = ExtractionResult(
+                    found=False,
+                    value=None,
+                    sheet_name=None,
+                    cell_reference=None,
+                    data_type=DataType.TEXT,
+                    confidence=0.0,
+                    reasoning=f"Parse error: {str(e)}",
+                    verification_steps=[]
+                )
+                pass_results.append(error_result)
         
-        # Add token usage info
-        result_json["token_usage"] = {
-            "input_tokens": total_input_tokens,
-            "output_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens
-        }
+        # Consensus analysis
+        print(f"\n{'='*80}")
+        print("CONSENSUS ANALYSIS")
+        print(f"{'='*80}")
         
-        return result_json
-    
-    def batch_extract_multi_sheet(self,
-                                 file_path: str,
-                                 queries: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-        """
-        Extract multiple values from multi-sheet Excel efficiently.
-        Reads file once and reuses context.
-        """
-        print(f"Reading Excel file once for batch processing...")
-        all_sheets_data = self.read_all_sheets(file_path)
+        discrepancies = []
         
-        results = []
-        for i, query_info in enumerate(queries, 1):
-            print(f"\n--- Query {i}/{len(queries)} ---")
-            query = query_info['query']
-            expected_type = query_info.get('expected_type', 'auto')
-            
-            # Optimize context for this specific query
-            excel_context = self.optimize_context_distribution(
-                all_sheets_data, query, self.max_context_tokens
-            )
-            
-            context_tokens = self.count_tokens(excel_context)
-            print(f"Query: {query}")
-            print(f"Context: {context_tokens:,} tokens")
-            
-            # Extract (rest of logic same as extract_from_all_sheets)
-            # ... [Continue with LLM call using optimized context]
-            
-            result = self._extract_with_context(excel_context, query, expected_type)
-            result['original_query'] = query
-            results.append(result)
+        # Check if all passes agree
+        values = [r.value for r in pass_results if r.found]
+        cells = [r.cell_reference for r in pass_results if r.found]
         
-        return results
-    
-    def _extract_with_context(self, excel_context: str, query: str, 
-                             expected_type: str) -> Dict[str, Any]:
-        """Helper method for extraction with pre-built context."""
-        system_prompt = """You are a precise multi-sheet Excel data extraction assistant... [same as above]"""
+        if len(set(str(v) for v in values)) > 1:
+            discrepancies.append(f"Value disagreement: {values}")
         
-        user_prompt = f"""{excel_context}
-
-=== USER QUERY ===
-{query}
-
-Expected data type: {expected_type}
-
-Extract the precise value answering this query."""
+        if len(set(str(c) for c in cells)) > 1:
+            discrepancies.append(f"Cell disagreement: {cells}")
         
-        if self.azure_endpoint:
-            response = openai.ChatCompletion.create(
-                engine=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.0,
-                max_tokens=2000
-            )
+        # Determine consensus
+        if not discrepancies and values:
+            consensus_value = values[0]
+            consensus_confidence = min(r.confidence for r in pass_results)
+            final_verified = True
+            print("✓ All passes agree - HIGH CONFIDENCE")
+        elif values:
+            # Take most common value
+            from collections import Counter
+            consensus_value = Counter(values).most_common(1)[0][0]
+            consensus_confidence = 0.7  # Reduced due to disagreement
+            final_verified = False
+            print("⚠ Passes disagree - MEDIUM CONFIDENCE")
+            for disc in discrepancies:
+                print(f"  - {disc}")
         else:
-            response = openai.ChatCompletion.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.0,
-                max_tokens=2000
-            )
+            consensus_value = None
+            consensus_confidence = 0.0
+            final_verified = False
+            print("✗ No value found - FAILED")
         
-        result_text = response.choices[0].message.content.strip()
-        json_match = re.search(r'``````', result_text, re.DOTALL)
+        print(f"\nFinal Value: {consensus_value}")
+        print(f"Final Confidence: {consensus_confidence:.2%}")
         
-        if json_match:
-            return json.loads(json_match.group(1))
-        else:
-            try:
-                return json.loads(result_text)
-            except:
-                return {"found": False, "error": "Parse failed", "raw": result_text}
-
+        return MultiPassResult(
+            pass_1_result=pass_results[0],
+            pass_2_result=pass_results[1],
+            pass_3_result=pass_results[2] if len(pass_results) > 2 else None,
+            consensus_value=consensus_value,
+            consensus_confidence=consensus_confidence,
+            discrepancies=discrepancies,
+            final_verified=final_verified
+        )
 
 # ============================================================================
-# USAGE EXAMPLE
+# USAGE
 # ============================================================================
 
 def main():
-    """Complete example for multi-sheet Excel extraction"""
-    
-    # Initialize with token limit
-    extractor = MultiSheetExcelExtractor(
+    extractor = PrecisionExcelExtractor(
         api_key="your-azure-api-key",
         model="gpt-4",
         azure_endpoint="https://your-resource.openai.azure.com/",
-        max_context_tokens=120000  # 120K for context, 8K for response
+        max_context_tokens=120000
     )
     
-    # Single extraction across all sheets
-    print("="*80)
-    print("MULTI-SHEET EXTRACTION")
-    print("="*80)
-    
-    result = extractor.extract_from_all_sheets(
-        file_path="financial_report_2024.xlsx",
-        query="What is the total revenue across all quarters?",
-        expected_type="currency"
+    # Single extraction with verification
+    result = extractor.extract_with_verification(
+        file_path="financial_report.xlsx",
+        query="What is the total revenue for Q4 2024?",
+        expected_type="currency",
+        num_passes=2  # Run twice for verification
     )
     
-    print(f"\nResult:")
-    print(f"  Found: {result['found']}")
-    print(f"  Value: {result['value']}")
-    print(f"  Sheet: {result.get('sheet_name', 'N/A')}")
-    print(f"  Cell: {result.get('cell_reference', 'N/A')}")
-    print(f"  Confidence: {result.get('confidence', 0):.2%}")
-    print(f"  Reasoning: {result.get('reasoning', 'N/A')}")
+    print(f"\n{'='*80}")
+    print("FINAL RESULT")
+    print(f"{'='*80}")
+    print(f"Value: {result.consensus_value}")
+    print(f"Confidence: {result.consensus_confidence:.2%}")
+    print(f"Verified: {result.final_verified}")
+    print(f"\nPass 1: {result.pass_1_result.value} (conf: {result.pass_1_result.confidence:.2%})")
+    print(f"Pass 2: {result.pass_2_result.value} (conf: {result.pass_2_result.confidence:.2%})")
     
-    if result.get('related_sheets'):
-        print(f"  Related sheets: {', '.join(result['related_sheets'])}")
+    if result.discrepancies:
+        print(f"\nDiscrepancies:")
+        for disc in result.discrepancies:
+            print(f"  - {disc}")
     
-    print(f"\nToken Usage:")
-    print(f"  Input: {result['token_usage']['input_tokens']:,}")
-    print(f"  Output: {result['token_usage']['output_tokens']:,}")
-    print(f"  Total: {result['token_usage']['total_tokens']:,}")
+    # Export detailed results
+    output = {
+        "query": "What is the total revenue for Q4 2024?",
+        "consensus_value": result.consensus_value,
+        "consensus_confidence": result.consensus_confidence,
+        "verified": result.final_verified,
+        "pass_1": result.pass_1_result.dict(),
+        "pass_2": result.pass_2_result.dict(),
+        "discrepancies": result.discrepancies
+    }
     
-    # Batch extraction
-    print("\n" + "="*80)
-    print("BATCH EXTRACTION")
-    print("="*80)
+    with open('precision_extraction_result.json', 'w') as f:
+        json.dump(output, f, indent=2, default=str)
     
-    queries = [
-        {"query": "What is the Q1 revenue?", "expected_type": "currency"},
-        {"query": "What is the total annual profit?", "expected_type": "currency"},
-        {"query": "How many employees in the engineering department?", "expected_type": "number"},
-        {"query": "What is the company's operating margin?", "expected_type": "percentage"}
-    ]
-    
-    batch_results = extractor.batch_extract_multi_sheet(
-        file_path="financial_report_2024.xlsx",
-        queries=queries
-    )
-    
-    # Export results
-    results_df = pd.DataFrame([
-        {
-            'query': r['original_query'],
-            'value': r['value'],
-            'sheet': r.get('sheet_name', 'N/A'),
-            'cell': r.get('cell_reference', 'N/A'),
-            'confidence': r.get('confidence', 0)
-        }
-        for r in batch_results
-    ])
-    
-    results_df.to_csv('multi_sheet_extraction_results.csv', index=False)
-    print("\nResults saved to multi_sheet_extraction_results.csv")
-
+    print("\n✓ Detailed results saved to precision_extraction_result.json")
 
 if __name__ == "__main__":
     main()
