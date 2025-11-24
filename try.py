@@ -1,20 +1,25 @@
-import openpyxl
-from openpyxl.utils import get_column_letter, column_index_from_string
-from openpyxl.utils.cell import coordinate_from_string, range_boundaries
-import json
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass, asdict
-import requests
-from collections import defaultdict
+"""
+Smart Excel Extraction System
+Extracts data from complex XLSX/XLSM files using natural language queries.
+Automatically scans all sheets and returns formatted answers.
+"""
 
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 
-# ==================== APPLY MONKEY PATCH FIRST ====================
-# This MUST be before any load_workbook calls
+import openpyxl
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import range_boundaries
+import json
+import requests
+from typing import Dict, List, Tuple, Optional, Any, Literal
+from dataclasses import dataclass, asdict, field
+from collections import defaultdict
+
+# ==================== APPLY OPENPYXL FIX FIRST ====================
 
 def apply_openpyxl_fix():
-    """Apply fix for hidden images issue - call this ONCE at startup"""
+    """Fix for hidden images issue - must be called before loading workbooks"""
     try:
         import openpyxl.reader.drawings
         import openpyxl.reader.excel
@@ -34,7 +39,7 @@ def apply_openpyxl_fix():
         )
 
         def patched_find_images(archive, path):
-            """Fixed version that skips hidden images"""
+            """Fixed version that skips hidden/NULL images"""
             src = archive.read(path)
             tree = fromstring(src)
             
@@ -49,7 +54,6 @@ def apply_openpyxl_fix():
             if rels_path in archive.namelist():
                 deps = get_dependents(archive, rels_path)
 
-            # Handle charts
             charts = []
             for rel in drawing._chart_rels:
                 try:
@@ -58,10 +62,9 @@ def apply_openpyxl_fix():
                     chart.anchor = rel.anchor
                     charts.append(chart)
                 except (TypeError, KeyError) as e:
-                    warn(f"Unable to read chart {rel.id}: {e}")
+                    warn(f"Unable to read chart: {e}")
                     continue
 
-            # Handle images with NULL fix
             images = []
             if not PILImage:
                 return charts, images
@@ -94,7 +97,6 @@ def apply_openpyxl_fix():
                     
             return charts, images
 
-        # Apply the patches
         openpyxl.reader.drawings.find_images = patched_find_images
         openpyxl.reader.excel.find_images = patched_find_images
         
@@ -105,25 +107,20 @@ def apply_openpyxl_fix():
         print(f"⚠ Warning: Could not apply patch: {e}")
         return False
 
-# Apply the fix IMMEDIATELY
+# Apply the fix immediately
 PATCH_APPLIED = apply_openpyxl_fix()
 
-# ==================== ROBUST EXCEL LOADER ====================
-
-import openpyxl
-from typing import Tuple, Optional
+# ==================== EXCEL LOADER ====================
 
 class ExcelLoader:
-    """Multi-strategy loader for problematic xlsm files"""
+    """Multi-strategy loader for problematic xlsm/xlsx files"""
     
     @staticmethod
     def load_workbook(file_path: str) -> Tuple[openpyxl.Workbook, openpyxl.Workbook]:
-        """
-        Try multiple strategies to load xlsm/xlsx files
-        """
+        """Try multiple strategies to load Excel files"""
         print(f"Loading: {file_path}")
         
-        # Strategy 1: Normal load with patch (works 90% of time)
+        # Strategy 1: Normal load with VBA
         try:
             print("  Strategy 1: Normal load with VBA...")
             wb_data = openpyxl.load_workbook(
@@ -145,82 +142,34 @@ class ExcelLoader:
             error_msg = str(e)
             print(f"  ✗ Strategy 1 failed: {error_msg[:100]}")
             
-            # Strategy 2: Read-only mode (skips drawings entirely)
+            # Strategy 2: Read-only mode
             if "NULL" in error_msg or "from_tree" in error_msg or "Nested" in error_msg:
                 try:
                     print("  Strategy 2: Read-only mode (no drawings)...")
                     wb_data = openpyxl.load_workbook(
                         file_path,
-                        read_only=True,  # Skips problematic drawing parsing
+                        read_only=True,
                         data_only=True,
                         keep_vba=False
                     )
-                    
-                    # For formula workbook, we need write mode
-                    # So load without drawings/images
                     wb_formula = openpyxl.load_workbook(
                         file_path,
                         read_only=False,
                         data_only=False,
-                        keep_vba=False  # Disable VBA to avoid issues
+                        keep_vba=False
                     )
                     print("  ✓ Success with Strategy 2 (read-only)")
                     return wb_data, wb_formula
                     
                 except Exception as e2:
                     print(f"  ✗ Strategy 2 failed: {str(e2)[:100]}")
-                    
-                    # Strategy 3: Pandas conversion (last resort)
-                    try:
-                        print("  Strategy 3: Convert via pandas...")
-                        import pandas as pd
-                        import tempfile
-                        import os
-                        
-                        # Create temp file
-                        temp_fd, temp_path = tempfile.mkstemp(suffix='.xlsx')
-                        os.close(temp_fd)
-                        
-                        # Read with pandas (more forgiving)
-                        excel_file = pd.ExcelFile(file_path, engine='openpyxl')
-                        
-                        # Write to clean xlsx
-                        with pd.ExcelWriter(temp_path, engine='openpyxl') as writer:
-                            for sheet_name in excel_file.sheet_names:
-                                try:
-                                    df = pd.read_excel(excel_file, sheet_name=sheet_name)
-                                    df.to_excel(writer, sheet_name=sheet_name, index=False)
-                                except Exception as sheet_error:
-                                    print(f"    ⚠ Skipped sheet '{sheet_name}': {sheet_error}")
-                                    continue
-                        
-                        # Load the cleaned file
-                        wb_data = openpyxl.load_workbook(temp_path, data_only=True)
-                        wb_formula = openpyxl.load_workbook(temp_path, data_only=False)
-                        
-                        print(f"  ✓ Success with Strategy 3 (cleaned file: {temp_path})")
-                        print(f"  ⚠ Note: Macros and formatting lost in conversion")
-                        
-                        return wb_data, wb_formula
-                        
-                    except Exception as e3:
-                        print(f"  ✗ Strategy 3 failed: {str(e3)[:100]}")
-                        raise RuntimeError(
-                            f"All loading strategies failed. Last error: {e3}"
-                        )
+                    raise RuntimeError(
+                        f"All loading strategies failed. Last error: {e2}"
+                    )
             else:
                 raise
 
-@dataclass
-class CellInfo:
-    """Metadata about a cell"""
-    row: int
-    col: int
-    value: Any
-    is_merged: bool
-    is_formula: bool
-    has_formatting: bool
-    coord: str
+# ==================== DATA STRUCTURES ====================
 
 @dataclass
 class TableRegion:
@@ -233,27 +182,53 @@ class TableRegion:
     headers: List[str]
     table_type: str  # 'standard', 'pivot', 'multi-level'
 
+@dataclass
+class ExtractionInstruction:
+    """Enhanced extraction instruction supporting ranges"""
+    table_id: int
+    extraction_type: Literal['single_cell', 'cell_range', 'row', 'column', 'table_section']
+    sheet_name: str = ""
+    
+    # For single cell
+    row: Optional[int] = None
+    col: Optional[int] = None
+    cell_address: Optional[str] = None
+    
+    # For ranges
+    start_row: Optional[int] = None
+    start_col: Optional[int] = None
+    end_row: Optional[int] = None
+    end_col: Optional[int] = None
+    range_address: Optional[str] = None
+    
+    # Metadata
+    extraction_context: str = ""
+    include_formatting: bool = False
+    include_formulas: bool = False
+
+@dataclass
+class WorkbookIndex:
+    """Complete index of all sheets and their tables"""
+    sheet_name: str
+    tables: List[TableRegion]
+    merged_cells: List[dict]
+    meta Dict
+
+# ==================== TABLE DETECTOR ====================
+
 class TableDetector:
-    """
-    Detects table boundaries and structure in Excel sheets.
-    Compatible with both regular and read-only workbooks.
-    """
+    """Detects table boundaries - works with regular and read-only workbooks"""
     
     def __init__(self, worksheet_data, worksheet_formula=None):
         self.ws_data = worksheet_data
         self.ws_formula = worksheet_formula
-        
-        # Check if read-only mode
         self.is_readonly = not hasattr(worksheet_data, 'cell')
         
-        # Handle merged cells (not available in read-only mode)
         if hasattr(worksheet_data, 'merged_cells'):
             self.merged_ranges = list(worksheet_data.merged_cells.ranges)
         else:
             self.merged_ranges = []
-            print("    ⚠ Read-only mode: merged cells detection disabled")
         
-        # Cache for cell values in read-only mode
         self._cell_cache = {}
         self._max_row = None
         self._max_col = None
@@ -264,11 +239,9 @@ class TableDetector:
             return self._max_row, self._max_col
         
         if hasattr(self.ws_data, 'max_row'):
-            # Regular workbook
             self._max_row = self.ws_data.max_row or 1
             self._max_col = self.ws_data.max_column or 1
         else:
-            # Read-only workbook: must scan
             self._max_row = 0
             self._max_col = 0
             
@@ -279,27 +252,21 @@ class TableDetector:
                     if cell.column > self._max_col:
                         self._max_col = cell.column
             
-            # Set minimum dimensions
             self._max_row = max(self._max_row, 1)
             self._max_col = max(self._max_col, 1)
         
         return self._max_row, self._max_col
     
     def _get_cell_safe(self, row: int, col: int):
-        """
-        Safe cell access for both regular and read-only workbooks.
-        Returns cell object or None if not found.
-        """
+        """Safe cell access for both modes"""
         cache_key = (row, col)
         
-        # Check cache first
         if cache_key in self._cell_cache:
             return self._cell_cache[cache_key]
         
         cell = None
         
         if self.is_readonly:
-            # Read-only mode: use iter_rows
             try:
                 for row_cells in self.ws_data.iter_rows(
                     min_row=row, max_row=row,
@@ -312,22 +279,17 @@ class TableDetector:
             except Exception:
                 cell = None
         else:
-            # Regular mode: direct access
             try:
                 cell = self.ws_data.cell(row, col)
             except Exception:
                 cell = None
         
-        # Cache the result
         self._cell_cache[cache_key] = cell
         return cell
     
     def _preload_region(self, min_row: int, max_row: int, 
                        min_col: int, max_col: int):
-        """
-        Preload a region of cells into cache for better performance.
-        Critical for read-only mode performance.
-        """
+        """Preload region for performance"""
         if self.is_readonly:
             try:
                 for row_cells in self.ws_data.iter_rows(
@@ -341,19 +303,16 @@ class TableDetector:
                 print(f"    ⚠ Warning preloading region: {e}")
     
     def detect_all_tables(self) -> List[TableRegion]:
-        """Find all table regions in the worksheet"""
+        """Find all table regions"""
         tables = []
         visited_cells = set()
         
         max_row, max_col = self._get_dimensions()
-        
-        # Limit scanning for performance
         scan_max_row = min(max_row, 1000)
         scan_max_col = min(max_col, 50)
         
         print(f"    Scanning {scan_max_row} rows × {scan_max_col} columns...")
         
-        # Preload the entire scan region for performance
         self._preload_region(1, scan_max_row, 1, scan_max_col)
         
         for row in range(1, scan_max_row + 1):
@@ -367,12 +326,10 @@ class TableDetector:
                 if not cell or cell.value is None:
                     continue
                 
-                # Check if this looks like a table header
                 if self._is_likely_header(cell, row, col):
                     table = self._extract_table_from_header(row, col)
                     if table:
                         tables.append(table)
-                        # Mark cells as visited
                         for r in range(table.min_row, table.max_row + 1):
                             for c in range(table.min_col, table.max_col + 1):
                                 visited_cells.add((r, c))
@@ -381,14 +338,10 @@ class TableDetector:
         return tables
     
     def _is_likely_header(self, cell, row: int, col: int) -> bool:
-        """
-        Heuristics to identify header cells.
-        Works with limited formatting info in read-only mode.
-        """
+        """Heuristics to identify headers"""
         if cell.value is None:
             return False
         
-        # Check for bold formatting (if available)
         has_bold = False
         has_fill = False
         
@@ -408,25 +361,21 @@ class TableDetector:
         except Exception:
             pass
         
-        # Check if it's text (not number)
         is_text = isinstance(cell.value, str)
         
-        # Check if cells below/to the right have data
         cell_below = self._get_cell_safe(row + 1, col)
         cell_right = self._get_cell_safe(row, col + 1)
         
         has_data_below = cell_below and cell_below.value is not None
         has_data_right = cell_right and cell_right.value is not None
         
-        # Header criteria: text + (formatting OR has data adjacent)
         return is_text and ((has_bold or has_fill) or 
                            (has_data_below or has_data_right))
     
     def _extract_table_from_header(self, start_row: int, 
                                    start_col: int) -> Optional[TableRegion]:
-        """Extract complete table starting from header position"""
+        """Extract table from header position"""
         
-        # Determine orientation by checking data density
         horizontal_density = self._count_consecutive_cells(
             start_row, start_col, 'horizontal'
         )
@@ -449,7 +398,7 @@ class TableDetector:
     
     def _count_consecutive_cells(self, row: int, col: int, 
                                  direction: str) -> int:
-        """Count consecutive non-empty cells in a direction"""
+        """Count consecutive non-empty cells"""
         count = 0
         max_row, max_col = self._get_dimensions()
         
@@ -461,7 +410,7 @@ class TableDetector:
                     count += 1
                 elif count > 0:
                     break
-        else:  # vertical
+        else:
             max_check = min(row + 20, max_row + 1)
             for r in range(row, max_check):
                 cell = self._get_cell_safe(r, col)
@@ -474,10 +423,9 @@ class TableDetector:
     
     def _extract_horizontal_table(self, header_row: int, 
                                   start_col: int) -> TableRegion:
-        """Extract table with horizontal headers (columns)"""
+        """Extract horizontal table"""
         max_row, max_col = self._get_dimensions()
         
-        # Find rightmost column of headers
         end_col = start_col
         for col in range(start_col, max_col + 1):
             cell = self._get_cell_safe(header_row, col)
@@ -485,10 +433,8 @@ class TableDetector:
                 break
             end_col = col
         
-        # Find bottom row of data
         bottom_row = header_row + 1
         for row in range(header_row + 1, min(max_row + 1, header_row + 1000)):
-            # Check if row has any data
             has_data = False
             for col in range(start_col, end_col + 1):
                 cell = self._get_cell_safe(row, col)
@@ -500,7 +446,6 @@ class TableDetector:
                 break
             bottom_row = row
         
-        # Extract headers
         headers = []
         for col in range(start_col, end_col + 1):
             cell = self._get_cell_safe(header_row, col)
@@ -521,10 +466,9 @@ class TableDetector:
     
     def _extract_vertical_table(self, start_row: int, 
                                header_col: int) -> TableRegion:
-        """Extract table with vertical headers (rows)"""
+        """Extract vertical table"""
         max_row, max_col = self._get_dimensions()
         
-        # Find bottom row of headers
         end_row = start_row
         for row in range(start_row, max_row + 1):
             cell = self._get_cell_safe(row, header_col)
@@ -532,10 +476,8 @@ class TableDetector:
                 break
             end_row = row
         
-        # Find rightmost column of data
         end_col = header_col + 1
         for col in range(header_col + 1, min(max_col + 1, header_col + 50)):
-            # Check if column has any data
             has_data = False
             for row in range(start_row, end_row + 1):
                 cell = self._get_cell_safe(row, col)
@@ -543,11 +485,10 @@ class TableDetector:
                     has_data = True
                     break
             
-            if not has_data:
+            if not has_
                 break
             end_col = col
         
-        # Extract headers
         headers = []
         for row in range(start_row, end_row + 1):
             cell = self._get_cell_safe(row, header_col)
@@ -567,10 +508,7 @@ class TableDetector:
         )
     
     def get_merged_cell_info(self) -> List[dict]:
-        """
-        Get all merged cell ranges.
-        Returns empty list in read-only mode.
-        """
+        """Get merged cell ranges"""
         if not self.merged_ranges:
             return []
         
@@ -578,11 +516,9 @@ class TableDetector:
         
         for merged_range in self.merged_ranges:
             try:
-                # Get bounds
                 bounds = merged_range.bounds
                 min_col, min_row, max_col, max_row = bounds
                 
-                # Get top-left value
                 top_left_cell = self._get_cell_safe(min_row, min_col)
                 top_left_value = top_left_cell.value if top_left_cell else None
                 
@@ -600,55 +536,11 @@ class TableDetector:
         
         return merged_info
     
-    def get_table_data(self, table: TableRegion, 
-                      include_headers: bool = True) -> List[List[Any]]:
-        """
-        Extract all data from a table region.
-        Useful for debugging or data export.
-        """
-        data = []
-        
-        start_row = table.min_row if include_headers else table.min_row + 1
-        
-        # Preload the entire table region
-        self._preload_region(
-            start_row, table.max_row,
-            table.min_col, table.max_col
-        )
-        
-        for row in range(start_row, table.max_row + 1):
-            row_data = []
-            for col in range(table.min_col, table.max_col + 1):
-                cell = self._get_cell_safe(row, col)
-                value = cell.value if cell else None
-                row_data.append(value)
-            data.append(row_data)
-        
-        return data
-
     def clear_cache(self):
-        """Clear the cell cache to free memory"""
+        """Clear cell cache"""
         self._cell_cache.clear()
-    
-    def print_table_summary(self, tables: List[TableRegion]):
-        """Print a human-readable summary of detected tables"""
-        print("\n" + "="*60)
-        print(f"TABLE DETECTION SUMMARY")
-        print("="*60)
-        
-        for idx, table in enumerate(tables):
-            print(f"\nTable {idx}:")
-            print(f"  Location: {get_column_letter(table.min_col)}{table.min_row} "
-                  f"to {get_column_letter(table.max_col)}{table.max_row}")
-            print(f"  Dimensions: {table.max_row - table.min_row + 1} rows × "
-                  f"{table.max_col - table.min_col + 1} columns")
-            print(f"  Orientation: {table.orientation}")
-            print(f"  Headers: {', '.join(table.headers[:5])}"
-                  f"{' ...' if len(table.headers) > 5 else ''}")
-        
-        print("\n" + "="*60)
 
-# ==================== STRUCTURE TO METADATA ====================
+# ==================== METADATA BUILDER ====================
 
 class StructureMetadataBuilder:
     """Convert Excel structure to LLM-friendly metadata"""
@@ -656,7 +548,7 @@ class StructureMetadataBuilder:
     @staticmethod
     def build_metadata(worksheet_name: str, tables: List[TableRegion], 
                       merged_cells: List[Dict]) -> Dict:
-        """Create metadata dictionary without actual sensitive values"""
+        """Create metadata without sensitive values"""
         
         metadata = {
             'worksheet_name': worksheet_name,
@@ -686,60 +578,156 @@ class StructureMetadataBuilder:
         
         return metadata
 
-# ==================== OPENAI INTEGRATION ====================
+# ==================== MULTI-SHEET SCANNER ====================
 
-@dataclass
-class ExtractionInstruction:
-    """Structured extraction instruction from LLM"""
-    table_id: int
-    row: int
-    col: int
-    cell_address: str
-    extraction_context: str
+class MultiSheetScanner:
+    """Scans entire workbook and builds searchable index"""
+    
+    def __init__(self, workbook_data, workbook_formula):
+        self.wb_data = workbook_data
+        self.wb_formula = workbook_formula
+        self.indexes: List[WorkbookIndex] = []
+    
+    def scan_all_sheets(self) -> List[WorkbookIndex]:
+        """Scan every sheet and detect tables"""
+        print(f"\n{'='*60}")
+        print("SCANNING ALL SHEETS")
+        print(f"{'='*60}")
+        
+        sheet_names = self.wb_data.sheetnames
+        print(f"Found {len(sheet_names)} sheets: {', '.join(sheet_names)}")
+        
+        for sheet_name in sheet_names:
+            try:
+                print(f"\n[Sheet: {sheet_name}]")
+                
+                ws_data = self.wb_data[sheet_name]
+                ws_formula = None
+                
+                if self.wb_formula and not self.wb_formula.read_only:
+                    try:
+                        ws_formula = self.wb_formula[sheet_name]
+                    except Exception:
+                        pass
+                
+                detector = TableDetector(ws_data, ws_formula)
+                tables = detector.detect_all_tables()
+                merged_cells = detector.get_merged_cell_info()
+                
+                metadata = StructureMetadataBuilder.build_metadata(
+                    sheet_name, tables, merged_cells
+                )
+                
+                self.indexes.append(WorkbookIndex(
+                    sheet_name=sheet_name,
+                    tables=tables,
+                    merged_cells=merged_cells,
+                    metadata=metadata
+                ))
+                
+                detector.clear_cache()
+                
+            except Exception as e:
+                print(f"  ⚠ Error scanning sheet '{sheet_name}': {e}")
+                continue
+        
+        print(f"\n{'='*60}")
+        print(f"✓ Indexed {len(self.indexes)} sheets successfully")
+        print(f"{'='*60}\n")
+        
+        return self.indexes
+    
+    def get_combined_metadata(self) -> Dict:
+        """Combine all sheet metadata for LLM"""
+        combined = {
+            'workbook': {
+                'total_sheets': len(self.indexes),
+                'sheets': []
+            }
+        }
+        
+        for index in self.indexes:
+            combined['workbook']['sheets'].append(index.metadata)
+        
+        return combined
 
-class OpenAIQueryProcessor:
-    """Process natural language queries using OpenAI private endpoint"""
+# ==================== OPENAI QUERY PROCESSOR ====================
+
+class SmartQueryProcessor:
+    """Process queries and find data across sheets"""
     
     def __init__(self, api_base_url: str, api_key: str, model: str = "gpt-4"):
         self.api_base_url = api_base_url.rstrip('/')
         self.api_key = api_key
         self.model = model
     
-    def process_query(self, user_query: str, meta Dict) -> List[ExtractionInstruction]:
-        """
-        Send query + metadata to OpenAI, get back extraction instructions.
-        Uses JSON mode for structured output.
-        """
+    def process_query_with_answer(self, user_query: str, 
+                                  combined_meta Dict) -> Tuple[List[ExtractionInstruction], str, str]:
+        """Find data and generate answer template"""
         
-        system_prompt = """You are an Excel extraction assistant. Given spreadsheet structure metadata and a user query, return precise extraction instructions.
+        system_prompt = """You are an Excel data retrieval assistant. Given metadata about ALL sheets in a workbook and a user query, you must:
 
-You will receive:
-1. Metadata about table locations, headers, and structure (NO sensitive data)
-2. A natural language query about what to extract
+1. Identify which sheet(s) contain the requested data
+2. Provide precise extraction instructions
+3. Generate a natural language answer template
 
-Return a JSON array of extraction instructions with this exact schema:
+EXTRACTION TYPES:
+- single_cell: One specific value
+- cell_range: Multiple related values
+- row: Entire row
+- column: Entire column
+- table_section: Section of a table
+
+Return JSON:
 {
   "extractions": [
     {
+      "sheet_name": "<exact sheet name>",
       "table_id": <int>,
+      "extraction_type": "single_cell" | "cell_range" | "row" | "column" | "table_section",
       "row": <int>,
       "col": <int>,
-      "cell_address": "<string like 'B5'>",
-      "extraction_context": "<explanation of what this cell represents>"
+      "cell_address": "<B5>",
+      "start_row": <int>,
+      "start_col": <int>,
+      "end_row": <int>,
+      "end_col": <int>,
+      "range_address": "<B5:D10>",
+      "extraction_context": "<description>",
+      "include_formatting": <bool>,
+      "include_formulas": <bool>
     }
-  ]
+  ],
+  "answer_template": "<Natural language with {placeholders}>",
+  "answer_format": "number" | "currency" | "percentage" | "date" | "text" | "table"
 }
 
-Be precise with coordinates. Use 1-based indexing for rows and columns."""
+EXAMPLE:
+Query: "What was the EBITDA for Asia in Q3 2024?"
+{
+  "extractions": [{
+    "sheet_name": "Q3 2024",
+    "table_id": 0,
+    "extraction_type": "single_cell",
+    "row": 15,
+    "col": 4,
+    "cell_address": "D15",
+    "extraction_context": "Asia EBITDA Q3 2024",
+    "include_formatting": true
+  }],
+  "answer_template": "The EBITDA for Asia in Q3 2024 was {D15}.",
+  "answer_format": "currency"
+}
 
-        user_message = f"""Spreadsheet Structure:
-{json.dumps(metadata, indent=2)}
+Be precise. Search ALL sheets."""
+
+        user_message = f"""Workbook Structure:
+{json.dumps(combined_metadata, indent=2)}
 
 User Query: {user_query}
 
-Return extraction instructions as JSON."""
+Return extraction instructions and answer template as JSON."""
 
-        # Call OpenAI API with JSON mode
         headers = {
             'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json'
@@ -751,8 +739,8 @@ Return extraction instructions as JSON."""
                 {'role': 'system', 'content': system_prompt},
                 {'role': 'user', 'content': user_message}
             ],
-            'response_format': {'type': 'json_object'},  # JSON mode
-            'temperature': 0  # Deterministic for extraction tasks
+            'response_format': {'type': 'json_object'},
+            'temperature': 0
         }
         
         try:
@@ -760,38 +748,68 @@ Return extraction instructions as JSON."""
                 f'{self.api_base_url}/chat/completions',
                 headers=headers,
                 json=payload,
-                timeout=30
+                timeout=60
             )
-            response.raise_for_status()
+            
+            if not response.ok:
+                error_detail = self._parse_error_response(response)
+                raise RuntimeError(
+                    f"OpenAI API error {response.status_code}: {error_detail}"
+                )
             
             result = response.json()
+            
+            if not isinstance(result, dict):
+                raise RuntimeError(f"Expected dict, got {type(result).__name__}")
+            
+            if 'error' in result:
+                raise RuntimeError(f"API error: {result['error']}")
+            
             content = result['choices'][0]['message']['content']
             extraction_data = json.loads(content)
             
-            # Parse into ExtractionInstruction objects
             instructions = []
             for item in extraction_data.get('extractions', []):
                 instructions.append(ExtractionInstruction(
-                    table_id=item['table_id'],
-                    row=item['row'],
-                    col=item['col'],
-                    cell_address=item['cell_address'],
-                    extraction_context=item['extraction_context']
+                    sheet_name=item.get('sheet_name', ''),
+                    table_id=int(item['table_id']),
+                    extraction_type=item['extraction_type'],
+                    row=item.get('row'),
+                    col=item.get('col'),
+                    cell_address=item.get('cell_address'),
+                    start_row=item.get('start_row'),
+                    start_col=item.get('start_col'),
+                    end_row=item.get('end_row'),
+                    end_col=item.get('end_col'),
+                    range_address=item.get('range_address'),
+                    extraction_context=item.get('extraction_context', ''),
+                    include_formatting=item.get('include_formatting', False),
+                    include_formulas=item.get('include_formulas', False)
                 ))
             
-            return instructions
+            answer_template = extraction_data.get('answer_template', '')
+            answer_format = extraction_data.get('answer_format', 'text')
             
-        except requests.exceptions.RequestException as e:
-            print(f"API request failed: {e}")
+            return instructions, answer_template, answer_format
+            
+        except Exception as e:
+            print(f"Error processing query: {e}")
             raise
-        except (KeyError, json.JSONDecodeError) as e:
-            print(f"Failed to parse API response: {e}")
-            raise
+    
+    def _parse_error_response(self, response: requests.Response) -> str:
+        """Extract error from failed response"""
+        try:
+            error_json = response.json()
+            if isinstance(error_json, dict) and 'error' in error_json:
+                return str(error_json['error'])
+            return str(error_json)
+        except Exception:
+            return response.text[:500]
 
 # ==================== PRECISE EXTRACTOR ====================
 
 class PreciseExtractor:
-    """Execute deterministic extraction based on LLM instructions"""
+    """Execute extraction with formatting support"""
     
     def __init__(self, workbook_data, workbook_formula):
         self.wb_data = workbook_data
@@ -799,121 +817,325 @@ class PreciseExtractor:
     
     def extract_values(self, worksheet_name: str, 
                       instructions: List[ExtractionInstruction]) -> Dict[str, Any]:
-        """Extract exact values using coordinates from LLM"""
+        """Execute extraction for multiple types"""
         
         ws_data = self.wb_data[worksheet_name]
-        ws_formula = self.wb_formula[worksheet_name]
+        ws_formula = self.wb_formula[worksheet_name] if self.wb_formula else None
         
         results = {}
         
-        for instruction in instructions:
+        for idx, instruction in enumerate(instructions):
             try:
-                cell_data = ws_data.cell(instruction.row, instruction.col)
-                cell_formula = ws_formula.cell(instruction.row, instruction.col)
+                if instruction.extraction_type == 'single_cell':
+                    result = self._extract_single_cell(
+                        ws_data, ws_formula, instruction
+                    )
+                    key = instruction.cell_address or f"cell_{idx}"
+                    
+                elif instruction.extraction_type in ['cell_range', 'row', 'column', 'table_section']:
+                    result = self._extract_range(
+                        ws_data, ws_formula, instruction
+                    )
+                    key = instruction.range_address or f"range_{idx}"
+                else:
+                    result = {'error': f'Unknown type: {instruction.extraction_type}'}
+                    key = f"unknown_{idx}"
                 
-                # Handle xlsm formula issue: data_only returns None if not cached
-                value = cell_data.value
-                
-                # Fallback: if data_only returns None, try to get formula
-                if value is None and cell_formula.value:
-                    value = f"FORMULA: {cell_formula.value}"
-                
-                results[instruction.cell_address] = {
-                    'value': value,
-                    'context': instruction.extraction_context,
-                    'coordinates': {
-                        'row': instruction.row,
-                        'col': instruction.col
-                    },
-                    'has_formula': cell_formula.value is not None and \
-                                  isinstance(cell_formula.value, str) and \
-                                  cell_formula.value.startswith('=')
-                }
+                results[key] = result
                 
             except Exception as e:
-                results[instruction.cell_address] = {
+                results[f"error_{idx}"] = {
                     'error': str(e),
                     'context': instruction.extraction_context
                 }
         
         return results
+    
+    def _extract_single_cell(self, ws_data, ws_formula, 
+                            instruction: ExtractionInstruction) -> Dict[str, Any]:
+        """Extract single cell"""
+        
+        cell_data = ws_data.cell(instruction.row, instruction.col)
+        cell_formula = ws_formula.cell(instruction.row, instruction.col) if ws_formula else None
+        
+        value = cell_data.value
+        
+        if value is None and cell_formula and cell_formula.value:
+            if isinstance(cell_formula.value, str) and cell_formula.value.startswith('='):
+                value = f"FORMULA_NOT_CACHED: {cell_formula.value}"
+        
+        result = {
+            'value': value,
+            'context': instruction.extraction_context,
+            'coordinates': {
+                'row': instruction.row,
+                'col': instruction.col,
+                'address': instruction.cell_address
+            }
+        }
+        
+        if instruction.include_formatting:
+            result['formatting'] = self._get_cell_formatting(cell_data)
+        
+        if instruction.include_formulas and cell_formula:
+            result['formula'] = cell_formula.value if cell_formula.value else None
+        
+        return result
+    
+    def _extract_range(self, ws_data, ws_formula, 
+                      instruction: ExtractionInstruction) -> Dict[str, Any]:
+        """Extract range of cells"""
+        
+        start_row = instruction.start_row
+        end_row = instruction.end_row
+        start_col = instruction.start_col
+        end_col = instruction.end_col
+        
+        data_array = []
+        
+        for row in range(start_row, end_row + 1):
+            row_data = []
+            
+            for col in range(start_col, end_col + 1):
+                cell_data = ws_data.cell(row, col)
+                value = cell_data.value
+                row_data.append(value)
+            
+            data_array.append(row_data)
+        
+        result = {
+            'extraction_type': instruction.extraction_type,
+            'data': data_array,
+            'context': instruction.extraction_context,
+            'dimensions': {
+                'rows': end_row - start_row + 1,
+                'cols': end_col - start_col + 1
+            },
+            'coordinates': {
+                'start_row': start_row,
+                'start_col': start_col,
+                'end_row': end_row,
+                'end_col': end_col,
+                'range': instruction.range_address
+            }
+        }
+        
+        return result
+    
+    def _get_cell_formatting(self, cell) -> Dict[str, Any]:
+        """Extract formatting"""
+        formatting = {}
+        
+        try:
+            if hasattr(cell, 'number_format'):
+                formatting['number_format'] = cell.number_format
+                formatting['is_currency'] = '$' in str(cell.number_format) or '€' in str(cell.number_format)
+                formatting['is_percentage'] = '%' in str(cell.number_format)
+            
+            if hasattr(cell, 'font') and cell.font:
+                formatting['font'] = {
+                    'bold': cell.font.bold,
+                    'size': cell.font.size
+                }
+                
+        except Exception as e:
+            formatting['error'] = f"Could not extract formatting: {e}"
+        
+        return formatting
 
-# ==================== MAIN ORCHESTRATOR ====================
+# ==================== ANSWER FORMATTER ====================
 
-class ExcelExtractionSystem:
-    """Main system orchestrating all components"""
+class AnswerFormatter:
+    """Format extracted data into natural language"""
+    
+    @staticmethod
+    def format_answer(template: str, extracted_values: Dict, 
+                     answer_format: str) -> str:
+        """Replace placeholders with formatted values"""
+        
+        answer = template
+        
+        for key, data in extracted_values.items():
+            placeholder = f"{{{key}}}"
+            
+            if placeholder in answer:
+                if 'data' in 
+                    formatted_value = AnswerFormatter._format_range(
+                        data, answer_format
+                    )
+                else:
+                    formatted_value = AnswerFormatter._format_single_value(
+                        data, answer_format
+                    )
+                
+                answer = answer.replace(placeholder, formatted_value)
+        
+        return answer
+    
+    @staticmethod
+    def _format_single_value( Dict, answer_format: str) -> str:
+        """Format single value"""
+        value = data.get('value')
+        formatting = data.get('formatting', {})
+        
+        if value is None:
+            return "N/A"
+        
+        if answer_format == 'currency' or formatting.get('is_currency'):
+            try:
+                return f"${float(value):,.2f}"
+            except (ValueError, TypeError):
+                return str(value)
+        
+        elif answer_format == 'percentage' or formatting.get('is_percentage'):
+            try:
+                return f"{float(value) * 100:.2f}%"
+            except (ValueError, TypeError):
+                return str(value)
+        
+        elif answer_format == 'number':
+            try:
+                return f"{float(value):,.2f}"
+            except (ValueError, TypeError):
+                return str(value)
+        
+        else:
+            return str(value)
+    
+    @staticmethod
+    def _format_range( Dict, answer_format: str) -> str:
+        """Format range of values"""
+        data_array = data.get('data', [])
+        
+        if not data_array:
+            return "No data"
+        
+        if len(data_array) == 1:
+            values = data_array[0]
+            formatted = [
+                AnswerFormatter._format_single_value({'value': v}, answer_format)
+                for v in values
+            ]
+            return ', '.join(formatted)
+        
+        elif all(len(row) == 1 for row in data_array):
+            values = [row[0] for row in data_array]
+            formatted = [
+                AnswerFormatter._format_single_value({'value': v}, answer_format)
+                for v in values
+            ]
+            return ', '.join(formatted)
+        
+        else:
+            lines = []
+            for row in data_array:
+                formatted_row = [
+                    AnswerFormatter._format_single_value({'value': v}, answer_format)
+                    for v in row
+                ]
+                lines.append(' | '.join(formatted_row))
+            return '\n' + '\n'.join(lines)
+
+# ==================== MAIN SYSTEM ====================
+
+class SmartExcelExtractionSystem:
+    """
+    Smart system that:
+    - Scans all sheets automatically
+    - Returns natural language answers
+    - No sheet name required
+    """
     
     def __init__(self, openai_base_url: str, openai_api_key: str, model: str = "gpt-4"):
-        self.query_processor = OpenAIQueryProcessor(
+        self.query_processor = SmartQueryProcessor(
             api_base_url=openai_base_url,
             api_key=openai_api_key,
             model=model
         )
     
-    def process_file(self, file_path: str, worksheet_name: str, user_query: str) -> Dict:
+    def process_file_smart(self, file_path: str, user_query: str) -> str:
         """
-        Complete extraction pipeline:
-        1. Load xlsm/xlsx with proper handling
-        2. Detect table structure
-        3. Build metadata (no sensitive data)
-        4. Query OpenAI for extraction plan
-        5. Execute precise extraction
+        Process file with natural language query.
+        Returns formatted answer string.
         """
         
-        print(f"[1/5] Loading workbook: {file_path}")
+        print(f"\n{'='*60}")
+        print(f"SMART EXCEL QUERY SYSTEM")
+        print(f"{'='*60}")
+        print(f"File: {file_path}")
+        print(f"Query: {user_query}")
+        
+        # Load workbook
+        print(f"\n[1/5] Loading workbook...")
         wb_data, wb_formula = ExcelLoader.load_workbook(file_path)
         
-        print(f"[2/5] Detecting tables in worksheet: {worksheet_name}")
-        ws_data = wb_data[worksheet_name]
-        ws_formula = wb_formula[worksheet_name]
+        # Scan all sheets
+        print(f"[2/5] Scanning all sheets...")
+        scanner = MultiSheetScanner(wb_data, wb_formula)
+        indexes = scanner.scan_all_sheets()
+        combined_metadata = scanner.get_combined_metadata()
         
-        detector = TableDetector(ws_data, ws_formula)
-        tables = detector.detect_all_tables()
-        merged_cells = detector.get_merged_cell_info()
+        # Query LLM
+        print(f"[3/5] Processing query across all sheets...")
+        instructions, answer_template, answer_format = \
+            self.query_processor.process_query_with_answer(user_query, combined_metadata)
         
-        print(f"    Found {len(tables)} tables")
+        print(f"    Found data in {len(set(i.sheet_name for i in instructions))} sheet(s)")
         
-        print("[3/5] Building structure metadata")
-        metadata = StructureMetadataBuilder.build_metadata(
-            worksheet_name, tables, merged_cells
+        # Extract values
+        print(f"[4/5] Extracting values...")
+        all_extracted = {}
+        
+        for instruction in instructions:
+            sheet_name = instruction.sheet_name
+            extractor = PreciseExtractor(wb_data, wb_formula)
+            result = extractor.extract_values(sheet_name, [instruction])
+            all_extracted.update(result)
+        
+        # Format answer
+        print(f"[5/5] Formatting answer...")
+        final_answer = AnswerFormatter.format_answer(
+            answer_template, all_extracted, answer_format
         )
         
-        print(f"[4/5] Querying OpenAI with: '{user_query}'")
-        instructions = self.query_processor.process_query(user_query, metadata)
+        print(f"\n{'='*60}")
+        print("✓ ANSWER READY")
+        print(f"{'='*60}\n")
         
-        print(f"    Received {len(instructions)} extraction instructions")
-        
-        print("[5/5] Executing precise extraction")
-        extractor = PreciseExtractor(wb_data, wb_formula)
-        results = extractor.extract_values(worksheet_name, instructions)
-        
-        return {
-            'query': user_query,
-            'metadata': metadata,
-            'instructions': [asdict(i) for i in instructions],
-            'extracted_values': results
-        }
+        return final_answer
 
-# ==================== USAGE EXAMPLE ====================
+
+# ==================== USAGE ====================
 
 if __name__ == "__main__":
     
-    # Initialize system with your private OpenAI endpoint
-    system = ExcelExtractionSystem(
+    # Initialize system
+    system = SmartExcelExtractionSystem(
         openai_base_url="https://your-private-openai-endpoint.com/v1",
-        openai_api_key="your-api-key",
+        openai_api_key="your-api-key-here",
         model="gpt-4"
     )
     
-    # Process file with natural language query
-    result = system.process_file(
+    # Example 1: Simple query
+    answer = system.process_file_smart(
         file_path="financial_data.xlsm",
-        worksheet_name="Q4 Results",
-        user_query="Extract the EBITDA value for Asia region in Q3 2024"
+        user_query="What was the EBITDA for Asia in Q3 2024?"
     )
+    print("ANSWER:")
+    print(answer)
     
-    # Display results
-    print("\n" + "="*60)
-    print("EXTRACTION RESULTS")
-    print("="*60)
-    print(json.dumps(result['extracted_values'], indent=2))
+    # Example 2: Multiple values
+    answer = system.process_file_smart(
+        file_path="financial_data.xlsm",
+        user_query="Show me all quarterly revenue for 2024"
+    )
+    print("ANSWER:")
+    print(answer)
+    
+    # Example 3: Cross-sheet query
+    answer = system.process_file_smart(
+        file_path="financial_data.xlsm",
+        user_query="What is the total headcount across all regions?"
+    )
+    print("ANSWER:")
+    print(answer)
