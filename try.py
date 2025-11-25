@@ -24,6 +24,64 @@ from collections import defaultdict, Counter
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 
+class OpenAIReranker:
+    """Rerank using OpenAI API instead of local model"""
+    
+    def __init__(self, api_key: str):
+        openai.api_key = api_key
+        print("Using OpenAI-based reranker")
+    
+    def rerank(self, query: str, matches: List[Tuple[FlattenedCell, float]], 
+               top_k: int = 5, verbose: bool = True) -> List[Tuple[FlattenedCell, float]]:
+        """Rerank using OpenAI relevance scoring"""
+        
+        if verbose:
+            print(f"\nReranking {len(matches)} results with OpenAI...")
+        
+        # Create candidates text
+        candidates = []
+        for i, (entry, _) in enumerate(matches):
+            candidates.append({
+                "id": i,
+                "text": f"{entry.path}: {entry.value}"
+            })
+        
+        # Ask GPT to rank by relevance
+        prompt = f"""Rank these {len(candidates)} results by relevance to the query: "{query}"
+
+Results:
+{json.dumps(candidates, indent=2)}
+
+Return ONLY a JSON array of IDs in order from most to least relevant.
+Example: [2, 0, 5, 1, 3]
+
+JSON array:"""
+        
+        response = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=200
+        )
+        
+        # Parse ranking
+        try:
+            ranking = json.loads(response.choices[0].message.content)
+        except:
+            # Fallback: extract numbers
+            ranking = [int(x) for x in re.findall(r'\d+', response.choices[0].message.content)]
+        
+        # Reorder matches
+        reranked = []
+        for idx in ranking[:top_k]:
+            if 0 <= idx < len(matches):
+                reranked.append(matches[idx])
+        
+        if verbose:
+            print(f"✓ Reranked, returning top {len(reranked)}")
+        
+        return reranked
+
 
 # ============================================================================
 # DATA MODELS
