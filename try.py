@@ -1,523 +1,566 @@
 """
-STRUCTURE-AWARE EXCEL EXTRACTOR
-Detects multi-dimensional tables, merged cells, headers, and spatial layouts
+UNIVERSAL EXCEL FLATTENER - Class-Based Architecture
+Converts any Excel structure into flat key-value pairs
+AI only searches, never computes
 """
 
 import pandas as pd
 import openpyxl
 from openpyxl.utils import get_column_letter, column_index_from_string
-import openai
-import json
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, List, Tuple, Any, Optional
 from dataclasses import dataclass
-from collections import defaultdict
+import re
+import json
+import openai
+from pathlib import Path
+
 
 # ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-openai.api_key = "your-key-here"
-
-# ============================================================================
-# STEP 1: DETECT TABLE STRUCTURES IN EXCEL
+# DATA MODELS
 # ============================================================================
 
 @dataclass
-class CellInfo:
-    """Complete information about a single cell"""
+class FlattenedCell:
+    """A single flattened cell with full context path"""
+    sheet: str
+    path: str  # e.g., "Revenue-Q4-2024" or "Summary-Total-Amount"
+    cell_ref: str  # e.g., "B5"
+    value: Any
+    value_type: str  # "number", "text", "date", etc.
     row: int
     col: int
-    value: Any
-    is_bold: bool
-    is_merged: bool
-    merged_range: Optional[str]
-    has_border: bool
-    has_fill: bool
-    font_size: float
-    alignment: str
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "sheet": self.sheet,
+            "path": self.path,
+            "cell_ref": self.cell_ref,
+            "value": self.value,
+            "value_type": self.value_type,
+            "row": self.row,
+            "col": self.col
+        }
+
 
 @dataclass
-class TableRegion:
-    """Detected table region with headers and data"""
-    sheet_name: str
-    start_row: int
-    end_row: int
-    start_col: int
-    end_col: int
-    header_rows: List[int]  # Which rows are headers
-    header_cols: List[int]  # Which columns are row headers
-    data_area: Tuple[int, int, int, int]  # (start_row, end_row, start_col, end_col)
-    headers_map: Dict[str, str]  # Maps cell ref -> header text
-    orientation: str  # "horizontal" or "vertical" or "matrix"
+class QueryResult:
+    """Result of a query operation"""
+    query: str
+    result: Any
+    matches: List[Tuple[str, Any, str, str]]  # (path, value, sheet, cell_ref)
+    operation: str
+    confidence: float = 1.0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query": self.query,
+            "result": self.result,
+            "matches": self.matches,
+            "operation": self.operation,
+            "confidence": self.confidence
+        }
 
-def load_excel_with_structure(file_path: str) -> Dict[str, Any]:
-    """
-    Load Excel with COMPLETE structural information.
-    Detects merged cells, table boundaries, headers, etc.
-    """
-    wb = openpyxl.load_workbook(file_path, data_only=False)
-    wb_data = openpyxl.load_workbook(file_path, data_only=True)
+
+# ============================================================================
+# STRUCTURE DETECTOR
+# ============================================================================
+
+class ExcelStructureDetector:
+    """Detects headers and table structures in Excel sheets"""
     
-    workbook_structure = {
-        "file_path": file_path,
-        "sheets": {}
-    }
+    def __init__(self, max_header_rows: int = 5, max_row_header_cols: int = 3):
+        self.max_header_rows = max_header_rows
+        self.max_row_header_cols = max_row_header_cols
     
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        ws_data = wb_data[sheet_name]
+    def detect_header_rows(self, ws) -> List[int]:
+        """
+        Detect which rows are likely headers by checking:
+        - Top N rows
+        - Mostly text (not numbers)
+        - Has bold formatting
+        """
+        header_rows = []
         
-        # Extract all cell information
-        cells = {}
-        merged_ranges = {}
+        for row_num in range(1, min(self.max_header_rows + 1, ws.max_row + 1)):
+            row_cells = [ws.cell(row_num, col) for col in range(1, ws.max_column + 1)]
+            
+            # Count non-empty cells
+            non_empty = [c for c in row_cells if c.value is not None]
+            if len(non_empty) < 2:
+                continue
+            
+            # Count text vs numbers
+            text_count = sum(1 for c in non_empty if isinstance(c.value, str))
+            
+            # Count bold
+            bold_count = sum(1 for c in non_empty if c.font and c.font.bold)
+            
+            # Header heuristic: mostly text or mostly bold
+            if text_count / len(non_empty) > 0.7 or bold_count / len(non_empty) > 0.5:
+                header_rows.append(row_num)
         
-        # Get merged cell ranges
-        for merged_range in ws.merged_cells.ranges:
-            min_col, min_row, max_col, max_row = merged_range.bounds
-            merged_str = str(merged_range)
-            for row in range(min_row, max_row + 1):
-                for col in range(min_col, max_col + 1):
-                    merged_ranges[(row, col)] = merged_str
+        return header_rows
+    
+    def detect_row_header_cols(self, ws, header_rows: List[int]) -> List[int]:
+        """
+        Detect which columns are row headers (left-side labels).
+        Usually the leftmost 1-2 columns with text.
+        """
+        row_header_cols = []
         
-        # Scan all cells
-        for row in range(1, ws.max_row + 1):
-            for col in range(1, ws.max_column + 1):
+        data_start_row = max(header_rows) + 1 if header_rows else 1
+        
+        for col_num in range(1, min(self.max_row_header_cols + 1, ws.max_column + 1)):
+            col_cells = [ws.cell(row, col_num) 
+                        for row in range(data_start_row, min(data_start_row + 20, ws.max_row + 1))]
+            
+            non_empty = [c for c in col_cells if c.value is not None]
+            if len(non_empty) < 2:
+                continue
+            
+            # Mostly text = probably labels
+            text_count = sum(1 for c in non_empty if isinstance(c.value, str))
+            if text_count / len(non_empty) > 0.6:
+                row_header_cols.append(col_num)
+        
+        return row_header_cols
+    
+    def build_column_header_path(self, ws, col: int, header_rows: List[int]) -> str:
+        """
+        Build hierarchical path from multi-level column headers.
+        E.g., if B1="Revenue" and B2="Q4", returns "Revenue-Q4"
+        """
+        parts = []
+        for row in header_rows:
+            cell = ws.cell(row, col)
+            if cell.value is not None and str(cell.value).strip():
+                parts.append(str(cell.value).strip())
+        
+        return "-".join(parts) if parts else f"Col{get_column_letter(col)}"
+    
+    def build_row_header_path(self, ws, row: int, row_header_cols: List[int]) -> str:
+        """
+        Build hierarchical path from multi-level row headers.
+        E.g., if A5="2024" and B5="Q4", returns "2024-Q4"
+        """
+        parts = []
+        for col in row_header_cols:
+            cell = ws.cell(row, col)
+            if cell.value is not None and str(cell.value).strip():
+                parts.append(str(cell.value).strip())
+        
+        return "-".join(parts) if parts else f"Row{row}"
+
+
+# ============================================================================
+# SHEET FLATTENER
+# ============================================================================
+
+class SheetFlattener:
+    """Flattens a single Excel sheet into path-value pairs"""
+    
+    def __init__(self, detector: ExcelStructureDetector):
+        self.detector = detector
+    
+    def flatten(self, ws, ws_data, sheet_name: str, verbose: bool = True) -> List[FlattenedCell]:
+        """
+        Flatten a single sheet into path-value pairs.
+        Handles multi-level headers automatically.
+        """
+        flattened = []
+        
+        # Detect structure
+        header_rows = self.detector.detect_header_rows(ws)
+        row_header_cols = self.detector.detect_row_header_cols(ws, header_rows)
+        
+        if verbose:
+            print(f"  Sheet '{sheet_name}':")
+            print(f"    Header rows: {header_rows}")
+            print(f"    Row header cols: {[get_column_letter(c) for c in row_header_cols]}")
+        
+        # Determine data area
+        data_start_row = max(header_rows) + 1 if header_rows else 1
+        data_start_col = max(row_header_cols) + 1 if row_header_cols else 1
+        
+        # Flatten all data cells
+        for row in range(data_start_row, ws.max_row + 1):
+            # Build row context
+            row_path = self.detector.build_row_header_path(ws, row, row_header_cols)
+            
+            for col in range(data_start_col, ws.max_column + 1):
                 cell = ws.cell(row, col)
                 cell_data = ws_data.cell(row, col)
                 
                 # Get actual value (formula result)
                 value = cell_data.value if cell_data.value is not None else cell.value
                 
-                if value is None or (isinstance(value, str) and not value.strip()):
+                if value is None:
                     continue
+                
+                # Build column context
+                col_path = self.detector.build_column_header_path(ws, col, header_rows)
+                
+                # Combine into full path: Sheet-RowHeaders-ColHeaders
+                full_path = f"{sheet_name}-{row_path}-{col_path}"
+                
+                # Determine value type
+                if isinstance(value, (int, float)):
+                    value_type = "number"
+                elif isinstance(value, str):
+                    value_type = "text"
+                else:
+                    value_type = "other"
                 
                 cell_ref = f"{get_column_letter(col)}{row}"
                 
-                cells[cell_ref] = CellInfo(
-                    row=row,
-                    col=col,
+                flattened.append(FlattenedCell(
+                    sheet=sheet_name,
+                    path=full_path,
+                    cell_ref=cell_ref,
                     value=value,
-                    is_bold=cell.font.bold if cell.font else False,
-                    is_merged=(row, col) in merged_ranges,
-                    merged_range=merged_ranges.get((row, col)),
-                    has_border=cell.border is not None and any([
-                        cell.border.top.style,
-                        cell.border.bottom.style,
-                        cell.border.left.style,
-                        cell.border.right.style
-                    ]) if cell.border else False,
-                    has_fill=cell.fill.start_color.index != "00000000" if cell.fill else False,
-                    font_size=cell.font.size if cell.font and cell.font.size else 11.0,
-                    alignment=cell.alignment.horizontal if cell.alignment else "general"
-                )
+                    value_type=value_type,
+                    row=row,
+                    col=col
+                ))
         
-        # Detect table regions
-        tables = detect_table_regions(cells, ws.max_row, ws.max_column)
-        
-        workbook_structure["sheets"][sheet_name] = {
-            "dimensions": {"rows": ws.max_row, "cols": ws.max_column},
-            "cells": cells,
-            "tables": tables
-        }
-    
-    wb.close()
-    wb_data.close()
-    
-    return workbook_structure
+        return flattened
 
-def detect_table_regions(cells: Dict[str, CellInfo], max_row: int, max_col: int) -> List[TableRegion]:
-    """
-    Intelligently detect table structures including:
-    - Multi-row headers
-    - Multi-column row headers
-    - Matrix-style tables
-    - Nested tables
-    """
-    tables = []
-    
-    # Build density map (which areas have data)
-    density = defaultdict(int)
-    for cell_info in cells.values():
-        density[cell_info.row] += 1
-    
-    # Find contiguous data regions
-    regions = []
-    in_region = False
-    start_row = None
-    
-    for row in range(1, max_row + 1):
-        if density[row] > 2:  # At least 3 cells in row
-            if not in_region:
-                start_row = row
-                in_region = True
-        else:
-            if in_region and start_row:
-                regions.append((start_row, row - 1))
-                in_region = False
-    
-    if in_region and start_row:
-        regions.append((start_row, max_row))
-    
-    # Analyze each region
-    for start_row, end_row in regions:
-        # Find column boundaries
-        cols_used = set()
-        for cell_info in cells.values():
-            if start_row <= cell_info.row <= end_row:
-                cols_used.add(cell_info.col)
-        
-        if not cols_used:
-            continue
-        
-        min_col = min(cols_used)
-        max_col = max(cols_used)
-        
-        # Detect header rows (bold, larger font, top of region)
-        header_rows = []
-        for row in range(start_row, min(start_row + 3, end_row + 1)):
-            row_cells = [c for c in cells.values() if c.row == row]
-            if not row_cells:
-                continue
-            
-            # Header heuristics
-            bold_ratio = sum(1 for c in row_cells if c.is_bold) / len(row_cells)
-            is_top_rows = row <= start_row + 2
-            
-            if bold_ratio > 0.5 or (is_top_rows and all(isinstance(c.value, str) for c in row_cells)):
-                header_rows.append(row)
-        
-        # Detect header columns (leftmost, bold)
-        header_cols = []
-        for col in range(min_col, min(min_col + 3, max_col + 1)):
-            col_cells = [c for c in cells.values() if c.col == col and start_row <= c.row <= end_row]
-            if not col_cells:
-                continue
-            
-            bold_ratio = sum(1 for c in col_cells if c.is_bold) / len(col_cells)
-            if bold_ratio > 0.3:
-                header_cols.append(col)
-        
-        # Data area (excluding headers)
-        data_start_row = max(header_rows) + 1 if header_rows else start_row
-        data_start_col = max(header_cols) + 1 if header_cols else min_col
-        
-        # Build headers map
-        headers_map = {}
-        for cell_ref, cell_info in cells.items():
-            if cell_info.row in header_rows or cell_info.col in header_cols:
-                headers_map[cell_ref] = str(cell_info.value)
-        
-        # Determine orientation
-        if header_rows and header_cols:
-            orientation = "matrix"
-        elif header_rows:
-            orientation = "horizontal"
-        elif header_cols:
-            orientation = "vertical"
-        else:
-            orientation = "horizontal"  # default
-        
-        tables.append(TableRegion(
-            sheet_name="",  # Will be filled in
-            start_row=start_row,
-            end_row=end_row,
-            start_col=min_col,
-            end_col=max_col,
-            header_rows=header_rows,
-            header_cols=header_cols,
-            data_area=(data_start_row, end_row, data_start_col, max_col),
-            headers_map=headers_map,
-            orientation=orientation
-        ))
-    
-    return tables
 
 # ============================================================================
-# STEP 2: CREATE RICH STRUCTURAL REPRESENTATION FOR LLM
+# WORKBOOK FLATTENER
 # ============================================================================
 
-def create_rich_representation(structure: Dict[str, Any]) -> str:
-    """
-    Create a RICH representation showing table structures, headers, orientation.
-    """
-    lines = [f"EXCEL FILE: {structure['file_path']}"]
-    lines.append("="*80)
-    lines.append("")
+class WorkbookFlattener:
+    """Flattens entire Excel workbook into searchable format"""
     
-    for sheet_name, sheet_info in structure["sheets"].items():
-        lines.append(f"### SHEET: {sheet_name} ###")
-        lines.append(f"Dimensions: {sheet_info['dimensions']['rows']} rows × {sheet_info['dimensions']['cols']} cols")
-        lines.append("")
-        
-        if not sheet_info["tables"]:
-            lines.append("No structured tables detected - showing raw ")
-            # Show first 20 cells
-            for i, (cell_ref, cell_info) in enumerate(list(sheet_info["cells"].items())[:20]):
-                lines.append(f"  {cell_ref} = {cell_info.value}")
-            lines.append("")
-            continue
-        
-        for table_idx, table in enumerate(sheet_info["tables"], 1):
-            lines.append(f"TABLE #{table_idx} (Orientation: {table.orientation.upper()})")
-            lines.append(f"  Location: Rows {table.start_row}-{table.end_row}, Cols {get_column_letter(table.start_col)}-{get_column_letter(table.end_col)}")
-            
-            # Show headers
-            if table.header_rows:
-                lines.append(f"  Header Rows: {table.header_rows}")
-                for row in table.header_rows:
-                    row_headers = []
-                    for cell_ref, text in table.headers_map.items():
-                        cell = sheet_info["cells"][cell_ref]
-                        if cell.row == row:
-                            row_headers.append(f"{cell_ref}='{text}'")
-                    if row_headers:
-                        lines.append(f"    Row {row}: {' | '.join(row_headers)}")
-            
-            if table.header_cols:
-                lines.append(f"  Header Columns: {[get_column_letter(c) for c in table.header_cols]}")
-            
-            # Show data area sample
-            lines.append(f"  Data Area: Rows {table.data_area[0]}-{table.data_area[1]}, Cols {get_column_letter(table.data_area[2])}-{get_column_letter(table.data_area[3])}")
-            lines.append(f"  Sample ")
-            
-            # Show first few data rows
-            data_rows = defaultdict(dict)
-            for cell_ref, cell_info in sheet_info["cells"].items():
-                if (table.data_area[0] <= cell_info.row <= table.data_area[1] and
-                    table.data_area[2] <= cell_info.col <= table.data_area[3]):
-                    data_rows[cell_info.row][cell_info.col] = cell_info.value
-            
-            for row_num in sorted(list(data_rows.keys())[:10]):
-                row_data = data_rows[row_num]
-                row_str = []
-                for col in sorted(row_data.keys())[:8]:
-                    val = str(row_data[col])[:30]
-                    row_str.append(f"{get_column_letter(col)}{row_num}={val}")
-                lines.append(f"    {' | '.join(row_str)}")
-            
-            lines.append("")
+    def __init__(self, detector: Optional[ExcelStructureDetector] = None):
+        self.detector = detector or ExcelStructureDetector()
+        self.sheet_flattener = SheetFlattener(self.detector)
+        self.flattened_ List[FlattenedCell] = []
+        self.file_path: Optional[str] = None
     
-    return "\n".join(lines)
+    def flatten(self, file_path: str, verbose: bool = True) -> List[FlattenedCell]:
+        """
+        Flatten entire workbook into searchable key-value pairs.
+        """
+        self.file_path = file_path
+        
+        if verbose:
+            print(f"Flattening workbook: {file_path}")
+            print("="*80)
+        
+        wb = openpyxl.load_workbook(file_path, data_only=False)
+        wb_data = openpyxl.load_workbook(file_path, data_only=True)
+        
+        all_flattened = []
+        
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            ws_data = wb_data[sheet_name]
+            
+            sheet_flattened = self.sheet_flattener.flatten(ws, ws_data, sheet_name, verbose)
+            all_flattened.extend(sheet_flattened)
+            
+            if verbose:
+                print(f"    → Extracted {len(sheet_flattened)} values")
+        
+        wb.close()
+        wb_data.close()
+        
+        self.flattened_data = all_flattened
+        
+        if verbose:
+            print(f"\n✓ Total flattened entries: {len(all_flattened)}")
+            print("="*80 + "\n")
+        
+        return all_flattened
+    
+    def export_to_csv(self, output_path: str):
+        """Export flattened data to CSV for inspection/debugging"""
+        import csv
+        
+        with open(output_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Sheet", "Path", "Cell", "Value", "Type", "Row", "Col"])
+            
+            for entry in self.flattened_
+                writer.writerow([
+                    entry.sheet,
+                    entry.path,
+                    entry.cell_ref,
+                    entry.value,
+                    entry.value_type,
+                    entry.row,
+                    entry.col
+                ])
+        
+        print(f"✓ Exported flattened data to: {output_path}")
+    
+    def export_to_json(self, output_path: str):
+        """Export flattened data to JSON"""
+        data = [entry.to_dict() for entry in self.flattened_data]
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, default=str)
+        
+        print(f"✓ Exported flattened data to: {output_path}")
+
 
 # ============================================================================
-# STEP 3: LLM PLANNING WITH STRUCTURE AWARENESS
+# AI SEMANTIC SEARCHER
 # ============================================================================
 
-STRUCTURE_AWARE_PROMPT = """You are an Excel extraction planner with STRUCTURE AWARENESS.
-
-You receive detailed information about:
-- Table locations and boundaries
-- Multi-row/multi-column headers
-- Table orientation (horizontal/vertical/matrix)
-- Merged cells and formatting
-
-Your job: Return a precise JSON extraction plan.
-
-JSON SCHEMA:
-{
-  "sheet_name": "sheet name",
-  "table_number": 1,
-  "cell_reference": "B5" or "B2:B10",
-  "operation": "return_cell" | "sum" | "average" | "filter_sum" | "lookup",
-  "context": {
-    "row_header": "Q4 2024",  // if applicable
-    "col_header": "Revenue",  // if applicable
-    "table_type": "horizontal" | "vertical" | "matrix"
-  },
-  "reasoning": "detailed explanation"
-}
-
-IMPORTANT:
-- Pay attention to table orientation
-- Use header information to locate correct cells
-- For matrix tables, consider both row and column headers
-- Be precise with cell references
-
-Example for MATRIX table:
-If headers are:
-  Row headers (A): Q1, Q2, Q3, Q4
-  Column headers (Row 1): Revenue, Profit, Expenses
-Query: "What is Q4 Revenue?"
-Answer: Find intersection of Q4 row and Revenue column
-"""
-
-def get_structure_aware_plan(structure: Dict[str, Any], query: str) -> Dict[str, Any]:
-    """Get extraction plan with full structure awareness"""
+class AISemanticSearcher:
+    """Uses AI to semantically search flattened paths (NO computation)"""
     
-    representation = create_rich_representation(structure)
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.api_key = api_key
+        self.model = model
+        openai.api_key = api_key
     
-    messages = [
-        {"role": "system", "content": STRUCTURE_AWARE_PROMPT},
-        {"role": "user", "content": f"{representation}\n\nQUERY: {query}\n\nReturn extraction plan in JSON:"}
-    ]
-    
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=messages,
-        temperature=0.0,
-        response_format={"type": "json_object"}
-    )
-    
-    plan = json.loads(response.choices[0].message.content)
-    
-    print("\n" + "="*80)
-    print("STRUCTURE-AWARE PLAN:")
-    print(json.dumps(plan, indent=2))
-    print("="*80 + "\n")
-    
-    return plan
-
-# ============================================================================
-# STEP 4: STRUCTURE-AWARE EXECUTION
-# ============================================================================
-
-def execute_structure_aware_plan(structure: Dict[str, Any], plan: Dict[str, Any]) -> Any:
-    """Execute plan with structure awareness"""
-    
-    sheet_name = plan["sheet_name"]
-    sheet_info = structure["sheets"][sheet_name]
-    cells = sheet_info["cells"]
-    
-    # Get table
-    table_num = plan.get("table_number", 1)
-    table = sheet_info["tables"][table_num - 1] if sheet_info["tables"] else None
-    
-    context = plan.get("context", {})
-    operation = plan["operation"]
-    
-    print(f"Executing on: {sheet_name}, Table #{table_num}")
-    print(f"Table type: {context.get('table_type', 'unknown')}")
-    print(f"Operation: {operation}")
-    
-    # If we have row/col headers in context, find intersection
-    if context.get("row_header") and context.get("col_header") and table:
-        row_header_text = context["row_header"]
-        col_header_text = context["col_header"]
+    def search(self, query: str, flattened: List[FlattenedCell], 
+               top_k: int = 5, sample_size: int = 500) -> List[Tuple[FlattenedCell, str]]:
+        """
+        Use AI to semantically search the flattened paths.
+        AI only picks which paths match - never computes values.
+        """
         
-        print(f"Looking for intersection: row='{row_header_text}', col='{col_header_text}'")
+        # Create compact representation of paths (sample for token efficiency)
+        path_list = []
+        sample = flattened[:sample_size] if len(flattened) > sample_size else flattened
         
-        # Find row matching row_header
-        target_row = None
-        for cell_ref, cell_info in cells.items():
-            if str(cell_info.value).strip().lower() == row_header_text.strip().lower():
-                if cell_info.col in table.header_cols:
-                    target_row = cell_info.row
-                    print(f"  Found row header at {cell_ref}, row={target_row}")
-                    break
+        for i, entry in enumerate(sample):
+            path_list.append(f"{i}: {entry.path} = {entry.value}")
         
-        # Find column matching col_header
-        target_col = None
-        for cell_ref, cell_info in cells.items():
-            if str(cell_info.value).strip().lower() == col_header_text.strip().lower():
-                if cell_info.row in table.header_rows:
-                    target_col = cell_info.col
-                    print(f"  Found col header at {cell_ref}, col={get_column_letter(target_col)}")
-                    break
+        paths_text = "\n".join(path_list)
         
-        if target_row and target_col:
-            # Find cell at intersection
-            intersection_ref = f"{get_column_letter(target_col)}{target_row}"
-            if intersection_ref in cells:
-                value = cells[intersection_ref].value
-                print(f"✓ Found value at intersection {intersection_ref}: {value}")
-                return value
-    
-    # Fallback: use cell_reference directly
-    cell_ref = plan.get("cell_reference", "")
-    
-    if ":" not in cell_ref:
-        # Single cell
-        if cell_ref in cells:
-            value = cells[cell_ref].value
-            print(f"✓ Retrieved {cell_ref}: {value}")
-            return value
-    else:
-        # Range operation
-        # Convert to pandas for easier range operations
-        df = pd.DataFrame.from_dict(
-            {cell_ref: [cell.value] for cell_ref, cell in cells.items()},
-            orient='index'
+        prompt = f"""You have a flattened Excel database with these entries:
+
+{paths_text}
+
+USER QUERY: {query}
+
+Return ONLY a JSON array of the indices (numbers) that best match the query.
+Return top {top_k} matches.
+
+Example: [45, 123, 67]
+
+If the query asks for a calculation (sum, average, etc.), return ALL relevant indices.
+
+JSON response:"""
+
+        response = openai.ChatCompletion.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=200
         )
         
-        # Parse range and extract values
-        start, end = cell_ref.split(":")
-        start_row, start_col = parse_cell_ref(start)
-        end_row, end_col = parse_cell_ref(end)
+        result_text = response.choices[0].message.content.strip()
         
-        values = []
-        for row in range(start_row, end_row + 1):
-            for col in range(start_col, end_col + 1):
-                ref = f"{get_column_letter(col)}{row}"
-                if ref in cells:
-                    val = cells[ref].value
-                    if isinstance(val, (int, float)):
-                        values.append(val)
+        # Parse JSON
+        try:
+            indices = json.loads(result_text)
+        except:
+            # Fallback: extract numbers
+            indices = [int(x) for x in re.findall(r'\d+', result_text)]
         
-        if operation == "sum":
-            result = sum(values)
+        matches = []
+        for idx in indices[:top_k]:
+            if 0 <= idx < len(sample):
+                matches.append((sample[idx], f"Match #{len(matches)+1}"))
+        
+        return matches
+
+
+# ============================================================================
+# VALUE EXTRACTOR
+# ============================================================================
+
+class ValueExtractor:
+    """Extracts values algorithmically from matches (GUARANTEED PRECISE)"""
+    
+    @staticmethod
+    def extract(matches: List[Tuple[FlattenedCell, str]], operation: str = "return") -> Any:
+        """
+        Extract value(s) algorithmically - NO AI involved.
+        
+        Operations:
+        - return: return first match
+        - sum: sum all numeric matches
+        - average: average all numeric matches
+        - max: maximum value
+        - min: minimum value
+        - count: count matches
+        - list: return all matches
+        """
+        
+        if not matches:
+            return None
+        
+        if operation == "return":
+            return matches[0][0].value
+        
+        elif operation == "sum":
+            values = [m[0].value for m in matches if m[0].value_type == "number"]
+            return sum(values) if values else None
+        
         elif operation == "average":
-            result = sum(values) / len(values) if values else 0
-        else:
-            result = values[0] if values else None
+            values = [m[0].value for m in matches if m[0].value_type == "number"]
+            return sum(values) / len(values) if values else None
         
-        print(f"✓ {operation.upper()} over {len(values)} values: {result}")
-        return result
-    
-    return None
+        elif operation == "max":
+            values = [m[0].value for m in matches if m[0].value_type == "number"]
+            return max(values) if values else None
+        
+        elif operation == "min":
+            values = [m[0].value for m in matches if m[0].value_type == "number"]
+            return min(values) if values else None
+        
+        elif operation == "count":
+            return len(matches)
+        
+        elif operation == "list":
+            return [m[0].value for m in matches]
+        
+        else:
+            raise ValueError(f"Unknown operation: {operation}")
 
-def parse_cell_ref(ref: str) -> Tuple[int, int]:
-    """Parse cell reference like 'B5' into (row, col)"""
-    import re
-    match = re.match(r'([A-Z]+)(\d+)', ref)
-    col_letter = match.group(1)
-    row_num = int(match.group(2))
-    col_num = column_index_from_string(col_letter)
-    return row_num, col_num
-
-# ============================================================================
-# MAIN INTERFACE
-# ============================================================================
-
-def query_excel_with_structure(file_path: str, query: str) -> Dict[str, Any]:
-    """Main function with full structure awareness"""
-    
-    print("\n" + "="*80)
-    print(f"QUERY: {query}")
-    print("="*80)
-    
-    # Load with structure detection
-    print("\n1. Loading Excel and detecting structures...")
-    structure = load_excel_with_structure(file_path)
-    
-    total_tables = sum(len(s["tables"]) for s in structure["sheets"].values())
-    print(f"✓ Found {total_tables} table regions across {len(structure['sheets'])} sheets")
-    
-    # Get structure-aware plan
-    print("\n2. Getting structure-aware extraction plan...")
-    plan = get_structure_aware_plan(structure, query)
-    
-    # Execute
-    print("\n3. Executing plan...")
-    value = execute_structure_aware_plan(structure, plan)
-    
-    print("\n" + "="*80)
-    print(f"RESULT: {value}")
-    print("="*80 + "\n")
-    
-    return {
-        "query": query,
-        "value": value,
-        "plan": plan
-    }
 
 # ============================================================================
-# USAGE
+# MAIN QUERY ENGINE
+# ============================================================================
+
+class ExcelQueryEngine:
+    """
+    Main query engine combining flattening, AI search, and algorithmic extraction.
+    """
+    
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.flattener = WorkbookFlattener()
+        self.searcher = AISemanticSearcher(api_key, model)
+        self.extractor = ValueExtractor()
+        self.flattened_ Optional[List[FlattenedCell]] = None
+        self.file_path: Optional[str] = None
+    
+    def load_workbook(self, file_path: str, verbose: bool = True) -> 'ExcelQueryEngine':
+        """Load and flatten workbook"""
+        self.file_path = file_path
+        self.flattened_data = self.flattener.flatten(file_path, verbose)
+        return self
+    
+    def query(self, query: str, operation: str = "return", 
+              top_k: int = 10, verbose: bool = True) -> QueryResult:
+        """
+        Query Excel using flattened structure + AI search + algorithmic extraction.
+        
+        Args:
+            query: Natural language query
+            operation: "return" | "sum" | "average" | "max" | "min" | "count" | "list"
+            top_k: Number of matches to retrieve
+            verbose: Print progress
+        """
+        
+        if self.flattened_data is None:
+            raise ValueError("No workbook loaded. Call load_workbook() first.")
+        
+        if verbose:
+            print("\n" + "="*80)
+            print(f"QUERY: {query}")
+            print(f"OPERATION: {operation}")
+            print("="*80 + "\n")
+        
+        # AI semantic search
+        if verbose:
+            print("Searching with AI...")
+        
+        matches = self.searcher.search(query, self.flattened_data, top_k)
+        
+        if verbose:
+            print(f"\n✓ Found {len(matches)} matches:")
+            for entry, label in matches[:5]:
+                print(f"  {label}: {entry.path} = {entry.value} [{entry.sheet}!{entry.cell_ref}]")
+        
+        # Algorithmic extraction
+        if verbose:
+            print(f"\nExtracting value (operation: {operation})...")
+        
+        result = self.extractor.extract(matches, operation)
+        
+        if verbose:
+            print(f"\n{'='*80}")
+            print(f"RESULT: {result}")
+            print(f"{'='*80}\n")
+        
+        return QueryResult(
+            query=query,
+            result=result,
+            matches=[(m.path, m.value, m.sheet, m.cell_ref) for m, _ in matches],
+            operation=operation
+        )
+    
+    def export_flattened(self, output_path: str, format: str = "csv"):
+        """Export flattened data for inspection"""
+        if format == "csv":
+            self.flattener.export_to_csv(output_path)
+        elif format == "json":
+            self.flattener.export_to_json(output_path)
+        else:
+            raise ValueError(f"Unknown format: {format}")
+    
+    def get_sample_paths(self, n: int = 20) -> List[str]:
+        """Get sample paths for debugging"""
+        if self.flattened_data is None:
+            return []
+        return [entry.path for entry in self.flattened_data[:n]]
+
+
+# ============================================================================
+# USAGE EXAMPLE
 # ============================================================================
 
 if __name__ == "__main__":
-    result = query_excel_with_structure(
-        "financial_report.xlsx",
-        "What is the Q4 2024 revenue?"
-    )
+    # Initialize query engine
+    engine = ExcelQueryEngine(api_key="your-openai-api-key")
     
-    print(f"Final Answer: {result['value']}")
+    # Load workbook
+    engine.load_workbook("financial_report.xlsx")
+    
+    # Example 1: Single value lookup
+    result1 = engine.query(
+        "What is the Q4 2024 revenue?",
+        operation="return"
+    )
+    print(f"Answer: {result1.result}\n")
+    
+    # Example 2: Sum multiple values
+    result2 = engine.query(
+        "What is the total of all quarterly revenues?",
+        operation="sum"
+    )
+    print(f"Answer: {result2.result}\n")
+    
+    # Example 3: Average
+    result3 = engine.query(
+        "What is the average profit margin?",
+        operation="average"
+    )
+    print(f"Answer: {result3.result}\n")
+    
+    # Export flattened structure for debugging
+    engine.export_flattened("flattened_excel.csv", format="csv")
+    
+    # Show sample paths
+    print("\nSample of flattened paths:")
+    for path in engine.get_sample_paths(10):
+        print(f"  {path}")
+    
+    # Export query results
+    with open("query_results.json", "w") as f:
+        json.dump([
+            result1.to_dict(),
+            result2.to_dict(),
+            result3.to_dict()
+        ], f, indent=2, default=str)
+    
+    print("\n✓ Query results exported to query_results.json")
