@@ -1,382 +1,303 @@
-import json
-from typing import Dict, Any, List, Optional, Literal
-import openpyxl
-from openpyxl.utils import get_column_letter
-import pandas as pd
-import openai
-import tiktoken
-
-# ------------------------------------------------------------
-# CONFIG
-# ------------------------------------------------------------
-
-OPENAI_API_KEY = "YOUR_KEY"
-OPENAI_MODEL = "gpt-4.1-mini"  # or gpt-4.1 / Azure deployment
-
-openai.api_key = OPENAI_API_KEY
-
-try:
-    encoding = tiktoken.encoding_for_model(OPENAI_MODEL)
-except KeyError:
-    encoding = tiktoken.get_encoding("cl100k_base")
-
-def count_tokens(text: str) -> int:
-    return len(encoding.encode(text))
-
-# ------------------------------------------------------------
-# 1. LOAD + INDEX WORKBOOK STRUCTURE (ALL SHEETS)
-# ------------------------------------------------------------
-
-def load_workbook_structure(path: str, max_rows_preview: int = 40, max_cols_preview: int = 20) -> Dict[str, Any]:
-    """
-    Load ALL sheets and build a compact structural index:
-    - dimensions
-    - header row candidates
-    - bold / label-like cells
-    - semantic preview grid
-    """
-    wb = openpyxl.load_workbook(path, data_only=True)
-    structure = {
-        "file_path": path,
-        "sheets": {}
-    }
-
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        max_row = min(ws.max_row, max_rows_preview)
-        max_col = min(ws.max_column, max_cols_preview)
-
-        headers = []
-        bold_labels = []
-        grid_preview = []
-
-        for r in range(1, max_row + 1):
-            row_values = []
-            for c in range(1, max_col + 1):
-                cell = ws.cell(r, c)
-                val = cell.value
-                if val is None:
-                    row_values.append("")
-                    continue
-
-                text_val = str(val)
-                row_values.append(text_val[:40])
-
-                # simple header heuristic: top 3 rows with mostly text
-                if r <= 3 and isinstance(val, str) and val.strip():
-                    headers.append({
-                        "cell": f"{get_column_letter(c)}{r}",
-                        "value": text_val
-                    })
-
-                # label-like: bold or leftmost column text
-                if isinstance(val, str) and (cell.font and cell.font.bold or c == 1):
-                    bold_labels.append({
-                        "cell": f"{get_column_letter(c)}{r}",
-                        "value": text_val
-                    })
-
-            if any(x for x in row_values):
-                grid_preview.append({
-                    "row": r,
-                    "cells": row_values
-                })
-
-        structure["sheets"][sheet_name] = {
-            "dimensions": {"rows": ws.max_row, "cols": ws.max_column},
-            "headers": headers[:40],
-            "labels": bold_labels[:80],
-            "grid_preview": grid_preview
-        }
-
-    wb.close()
-    return structure
-
-# ------------------------------------------------------------
-# 2. LLM: PLAN GENERATION (WHAT / WHERE), NOT ANSWER
-# ------------------------------------------------------------
-
-PLAN_SYSTEM_PROMPT = """
-You are a planning assistant for Excel workbooks.
-
-You NEVER compute numeric answers yourself.
-You ONLY produce a MACHINE-READABLE PLAN that tells a separate engine:
-- which sheet(s) to read
-- which columns/rows/cells to use
-- what filters to apply
-- what aggregation to perform
-
-The engine will execute the plan directly on the workbook and compute the final answer.
-
-You must ALWAYS return valid JSON with this exact schema:
-
-{
-  "targets": [
-    {
-      "sheet": "sheet name",
-      "range": "e.g. B2:B13 or A2:D100 or single cell 'C7'",
-      "role": "value" | "label" | "filter" | "lookup_key"
-    }
-  ],
-  "operations": [
-    {
-      "type": "sum" | "avg" | "max" | "min" | "lookup" | "filter_then_sum" | "return_cell",
-      "description": "natural language description of what to do algorithmically",
-      "on": "reference to one or more ranges from targets, e.g. ['Sheet1!B2:B13']",
-      "filters": [
-        {
-          "sheet": "sheet name",
-          "column": "column letter or header name if known",
-          "condition": "python-style boolean expression, e.g. value == 'Q4 2024' or value > 0"
-        }
-      ]
-    }
-  ],
-  "expected_type": "number | currency | percentage | text | date",
-  "notes": "any clarification that helps the engine, e.g. 'Q4 is the row where column A == Q4'"
-}
+"""
+SIMPLE WORKING EXCEL EXTRACTOR
+Hybrid LLM + algorithmic approach that actually works
 """
 
-def build_structure_prompt(structure: Dict[str, Any], query: str, max_tokens: int = 8000) -> str:
+import pandas as pd
+import openpyxl
+from openpyxl.utils import get_column_letter, column_index_from_string
+import openai
+import json
+import re
+from typing import Dict, Any, List, Optional
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+openai.api_key = "your-key-here"  # Set your OpenAI key
+
+# ============================================================================
+# STEP 1: READ EXCEL FILE (ALL SHEETS)
+# ============================================================================
+
+def read_excel_all_sheets(file_path: str) -> Dict[str, pd.DataFrame]:
     """
-    Turn the workbook structural index into a compact prompt.
-    Only previews + headers/labels, no full data dump.
+    Read all sheets from Excel file into pandas DataFrames.
+    Returns dict of {sheet_name: dataframe}
     """
-    parts: List[str] = []
-    parts.append(f"FILE: {structure['file_path']}")
-    parts.append("This is a structural summary of all sheets. Values are truncated previews.\n")
+    excel_file = pd.ExcelFile(file_path)
+    sheets = {}
+    
+    for sheet_name in excel_file.sheet_names:
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+        sheets[sheet_name] = df
+        print(f"✓ Loaded sheet '{sheet_name}': {df.shape[0]} rows × {df.shape[1]} cols")
+    
+    return sheets
 
-    for sheet_name, info in structure["sheets"].items():
-        parts.append(f"=== SHEET: {sheet_name} ===")
-        dims = info["dimensions"]
-        parts.append(f"Dimensions: {dims['rows']} rows x {dims['cols']} cols")
+# ============================================================================
+# STEP 2: CREATE COMPACT SUMMARY FOR LLM
+# ============================================================================
 
-        if info["headers"]:
-            h_preview = [f"{h['cell']}='{h['value']}'" for h in info["headers"][:10]]
-            parts.append("Headers: " + " | ".join(h_preview))
+def create_sheet_summary(df: pd.DataFrame, sheet_name: str, max_rows: int = 30) -> str:
+    """
+    Create a compact text representation of a sheet.
+    """
+    lines = [f"SHEET: {sheet_name} ({df.shape[0]} rows × {df.shape[1]} cols)"]
+    lines.append("")
+    
+    # Show first N rows
+    preview_rows = min(max_rows, len(df))
+    
+    for row_idx in range(preview_rows):
+        row = df.iloc[row_idx]
+        # Format as: Row1: A=value, B=value, C=value, ...
+        non_empty = []
+        for col_idx, val in enumerate(row):
+            if pd.notna(val) and str(val).strip():
+                col_letter = get_column_letter(col_idx + 1)
+                val_str = str(val)[:50]  # Truncate long values
+                non_empty.append(f"{col_letter}={val_str}")
+        
+        if non_empty:
+            lines.append(f"Row{row_idx+1}: {', '.join(non_empty)}")
+    
+    if len(df) > preview_rows:
+        lines.append(f"... ({len(df) - preview_rows} more rows)")
+    
+    return "\n".join(lines)
 
-        if info["labels"]:
-            l_preview = [f"{l['cell']}='{l['value']}'" for l in info["labels"][:10]]
-            parts.append("Labels: " + " | ".join(l_preview))
-
-        # brief grid preview
-        parts.append("Preview rows:")
-        for row in info["grid_preview"][:8]:
-            # show first 6 non-empty cells
-            cells = [v for v in row["cells"] if v][:6]
-            if cells:
-                parts.append(f"  Row {row['row']}: " + " | ".join(cells))
-
-        parts.append("")  # blank line between sheets
-
-        text_so_far = "\n".join(parts)
-        if count_tokens(text_so_far) > max_tokens:
-            parts.append("... (remaining sheets omitted to stay within context limit)")
-            break
-
-    parts.append("\nUSER QUERY:")
-    parts.append(query)
-
-    parts.append("""
-Return ONLY the JSON plan (no explanation text).
-Remember: you do NOT compute the numeric result, only tell the engine WHERE and WHAT to compute.
-""")
-
+def create_workbook_summary(sheets: Dict[str, pd.DataFrame]) -> str:
+    """
+    Create summary of entire workbook.
+    """
+    parts = [f"EXCEL WORKBOOK with {len(sheets)} sheets: {', '.join(sheets.keys())}"]
+    parts.append("="*80)
+    parts.append("")
+    
+    for sheet_name, df in sheets.items():
+        parts.append(create_sheet_summary(df, sheet_name))
+        parts.append("")
+    
     return "\n".join(parts)
 
-def get_llm_plan(structure: Dict[str, Any], query: str, expected_type: str = "auto") -> Dict[str, Any]:
-    prompt = build_structure_prompt(structure, query)
+# ============================================================================
+# STEP 3: LLM GENERATES EXTRACTION INSTRUCTIONS (NOT THE ANSWER)
+# ============================================================================
 
-    messages = [
-        {"role": "system", "content": PLAN_SYSTEM_PROMPT},
-        {"role": "user", "content": prompt}
-    ]
+SYSTEM_PROMPT = """You are an Excel data extraction planner. 
 
-    resp = openai.ChatCompletion.create(
-        model=OPENAI_MODEL,
-        messages=messages,
+Your job is to analyze the Excel structure and tell the user EXACTLY where to find the data they're asking for.
+
+Return a JSON object with this EXACT structure:
+{
+  "sheet_name": "the sheet name containing the answer",
+  "cell_reference": "exact cell reference like B5 or range like B2:B10",
+  "operation": "return_cell" or "sum" or "average" or "max" or "min" or "count",
+  "reasoning": "brief explanation of why this cell/range contains the answer"
+}
+
+RULES:
+- cell_reference must be in Excel format (A1, B5, C2:C10, etc.)
+- operation must be one of: return_cell, sum, average, max, min, count
+- Use "return_cell" for single values, other operations for ranges
+- Be PRECISE with cell references
+
+Examples:
+Query: "What is the total revenue?"
+Response: {"sheet_name": "Summary", "cell_reference": "B10", "operation": "return_cell", "reasoning": "Cell B10 contains 'Total Revenue' value"}
+
+Query: "What is the sum of all sales in Q1?"
+Response: {"sheet_name": "Q1_Sales", "cell_reference": "C2:C50", "operation": "sum", "reasoning": "Column C contains sales amounts from row 2 to 50"}
+"""
+
+def get_extraction_plan(workbook_summary: str, query: str) -> Dict[str, Any]:
+    """
+    Ask LLM to generate extraction plan (NOT compute the answer).
+    """
+    user_prompt = f"""{workbook_summary}
+
+USER QUERY: {query}
+
+Analyze the data above and return ONLY a JSON object telling me exactly where to find the answer.
+Do NOT compute the answer yourself. Just tell me the cell reference and operation."""
+
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ],
         temperature=0.0,
-        max_tokens=1024,
         response_format={"type": "json_object"}
     )
-
-    plan_str = resp.choices[0].message.content
+    
+    plan_str = response.choices[0].message.content
     plan = json.loads(plan_str)
-
-    # inject expected_type if you want to override
-    if expected_type != "auto":
-        plan["expected_type"] = expected_type
-
+    
+    print("\n" + "="*80)
+    print("LLM EXTRACTION PLAN:")
+    print(json.dumps(plan, indent=2))
+    print("="*80 + "\n")
+    
     return plan
 
-# ------------------------------------------------------------
-# 3. EXECUTION ENGINE: ALGORITHMIC PLAN EXECUTION
-# ------------------------------------------------------------
+# ============================================================================
+# STEP 4: EXECUTE PLAN ALGORITHMICALLY (GUARANTEED PRECISE)
+# ============================================================================
 
-def range_to_indices(ws, rng: str):
+def parse_cell_reference(cell_ref: str) -> tuple:
     """
-    Convert a range like 'B2:B10' or 'A2:D100' or 'C7' to (min_row, max_row, min_col, max_col).
+    Parse cell reference like 'B5' into (row, col) as 0-indexed.
+    Returns (row_idx, col_idx)
     """
-    if "!" in rng:
-        rng = rng.split("!", 1)[1]
+    match = re.match(r'([A-Z]+)(\d+)', cell_ref.upper())
+    if not match:
+        raise ValueError(f"Invalid cell reference: {cell_ref}")
+    
+    col_letter = match.group(1)
+    row_num = int(match.group(2))
+    
+    col_idx = column_index_from_string(col_letter) - 1  # Convert to 0-indexed
+    row_idx = row_num - 1  # Convert to 0-indexed
+    
+    return row_idx, col_idx
 
-    if ":" in rng:
-        start, end = rng.split(":")
+def parse_range(range_ref: str) -> tuple:
+    """
+    Parse range like 'B2:B10' into (start_row, start_col, end_row, end_col) as 0-indexed.
+    """
+    if ':' not in range_ref:
+        row, col = parse_cell_reference(range_ref)
+        return row, col, row, col
+    
+    start_cell, end_cell = range_ref.split(':')
+    start_row, start_col = parse_cell_reference(start_cell)
+    end_row, end_col = parse_cell_reference(end_cell)
+    
+    return start_row, start_col, end_row, end_col
+
+def execute_plan(sheets: Dict[str, pd.DataFrame], plan: Dict[str, Any]) -> Any:
+    """
+    Execute the extraction plan on actual Excel data.
+    This is ALGORITHMIC - no LLM involved, guaranteed precision.
+    """
+    sheet_name = plan['sheet_name']
+    cell_ref = plan['cell_reference']
+    operation = plan['operation']
+    
+    if sheet_name not in sheets:
+        raise ValueError(f"Sheet '{sheet_name}' not found. Available: {list(sheets.keys())}")
+    
+    df = sheets[sheet_name]
+    
+    print(f"Executing: {operation} on {sheet_name}!{cell_ref}")
+    
+    if operation == "return_cell":
+        # Single cell lookup
+        row_idx, col_idx = parse_cell_reference(cell_ref)
+        value = df.iloc[row_idx, col_idx]
+        print(f"✓ Found value at {cell_ref}: {value}")
+        return value
+    
     else:
-        start = end = rng
-
-    start_cell = ws[start]
-    end_cell = ws[end]
-
-    min_row = min(start_cell.row, end_cell.row)
-    max_row = max(start_cell.row, end_cell.row)
-    min_col = min(start_cell.column, end_cell.column)
-    max_col = max(start_cell.column, end_cell.column)
-
-    return min_row, max_row, min_col, max_col
-
-def sheet_to_dataframe(ws) -> pd.DataFrame:
-    """
-    Convert an entire sheet to a pandas DataFrame with integer columns.
-    No header inference here; we'll use indices or additional info from plan.
-    """
-    data = []
-    max_row = ws.max_row
-    max_col = ws.max_column
-
-    for r in range(1, max_row + 1):
-        row_vals = []
-        for c in range(1, max_col + 1):
-            row_vals.append(ws.cell(r, c).value)
-        data.append(row_vals)
-
-    df = pd.DataFrame(data)
-    return df
-
-def apply_filters(df: pd.DataFrame, flt: Dict[str, Any], header_row: Optional[int] = None) -> pd.DataFrame:
-    """
-    Apply a single filter described in the plan.
-    - flt['column'] can be a column letter (A,B,...) or header name if header_row is known.
-    - flt['condition'] is a python expression in terms of 'value'.
-    """
-    cond = flt["condition"]
-    col_spec = flt["column"]
-
-    if isinstance(col_spec, str) and len(col_spec) == 1 and col_spec.isalpha():
-        col_idx = ord(col_spec.upper()) - ord("A")
-    else:
-        # assume header name; find in header row
-        if header_row is None:
-            raise ValueError("Header row not provided but filter uses header name")
-        header_series = df.iloc[header_row - 1, :]
-        matches = [i for i, v in enumerate(header_series) if str(v).strip().lower() == col_spec.strip().lower()]
-        if not matches:
-            raise ValueError(f"Header '{col_spec}' not found")
-        col_idx = matches[0]
-
-    series = df.iloc[:, col_idx]
-
-    mask = []
-    for v in series:
-        value = v
-        try:
-            keep = bool(eval(cond, {"__builtins__": {}}, {"value": value}))
-        except Exception:
-            keep = False
-        mask.append(keep)
-
-    return df[pd.Series(mask).values]
-
-def execute_plan_on_workbook(path: str, plan: Dict[str, Any]) -> Any:
-    wb = openpyxl.load_workbook(path, data_only=True)
-
-    # Pre-load all DFS for convenient pandas ops
-    dfs: Dict[str, pd.DataFrame] = {name: sheet_to_dataframe(wb[name]) for name in wb.sheetnames}
-
-    def parse_range_string(sheet_name: str, rng: str):
-        ws = wb[sheet_name]
-        r1, r2, c1, c2 = range_to_indices(ws, rng)
-        df = dfs[sheet_name]
-        sub = df.iloc[r1-1:r2, c1-1:c2]
-        return sub
-
-    result_value = None
-
-    for op in plan.get("operations", []):
-        op_type = op["type"]
-        on_refs = op["on"]
-
-        if op_type in ("sum", "filter_then_sum"):
-            total = 0.0
-            for ref in on_refs:
-                # ref like "Sheet1!B2:B13" or just "B2:B13" with implicit sheet
-                if "!" in ref:
-                    sheet_name, rng = ref.split("!", 1)
-                else:
-                    # fall back to first sheet mentioned in targets
-                    sheet_name = plan["targets"][0]["sheet"]
-                    rng = ref
-
-                sub = parse_range_string(sheet_name, rng)
-
-                if op_type == "filter_then_sum" and op.get("filters"):
-                    for flt in op["filters"]:
-                        if flt["sheet"] != sheet_name:
-                            continue
-                        # assume first row header if header name based
-                        sub = apply_filters(sub, flt, header_row=1)
-
-                total += pd.to_numeric(sub.values.flatten(), errors="coerce").sum(skipna=True)
-
-            result_value = total
-
-        elif op_type == "return_cell":
-            # Expect exactly one ref
-            ref = on_refs[0]
-            if "!" in ref:
-                sheet_name, cell_ref = ref.split("!", 1)
-            else:
-                sheet_name = plan["targets"][0]["sheet"]
-                cell_ref = ref
-            ws = wb[sheet_name]
-            result_value = ws[cell_ref].value
-
-        elif op_type == "lookup":
-            # Implement simple VLOOKUP-like op if needed
-            # (left as extension point)
-            raise NotImplementedError("lookup not implemented in this snippet")
-
+        # Range operations (sum, average, etc.)
+        start_row, start_col, end_row, end_col = parse_range(cell_ref)
+        
+        # Extract the range
+        range_data = df.iloc[start_row:end_row+1, start_col:end_col+1]
+        
+        # Convert to numeric, coercing errors
+        numeric_data = pd.to_numeric(range_data.values.flatten(), errors='coerce')
+        numeric_data = numeric_data[~pd.isna(numeric_data)]  # Remove NaN
+        
+        print(f"✓ Extracted {len(numeric_data)} numeric values from range")
+        
+        if operation == "sum":
+            result = float(numeric_data.sum())
+        elif operation == "average":
+            result = float(numeric_data.mean())
+        elif operation == "max":
+            result = float(numeric_data.max())
+        elif operation == "min":
+            result = float(numeric_data.min())
+        elif operation == "count":
+            result = int(len(numeric_data))
         else:
-            raise ValueError(f"Unsupported operation type: {op_type}")
+            raise ValueError(f"Unknown operation: {operation}")
+        
+        print(f"✓ {operation.upper()} = {result}")
+        return result
 
-    wb.close()
-    return result_value
+# ============================================================================
+# STEP 5: MAIN INTERFACE
+# ============================================================================
 
-# ------------------------------------------------------------
-# 4. END-TO-END USAGE
-# ------------------------------------------------------------
-
-def answer_query_from_excel(path: str, query: str, expected_type: str = "auto") -> Dict[str, Any]:
-    # 1) index structure
-    structure = load_workbook_structure(path)
-
-    # 2) ask LLM for a plan (NO numeric answer)
-    plan = get_llm_plan(structure, query, expected_type)
-
-    # 3) execute deterministically
-    value = execute_plan_on_workbook(path, plan)
-
+def query_excel(file_path: str, query: str) -> Dict[str, Any]:
+    """
+    Main function: query Excel file in natural language.
+    Returns the exact extracted value.
+    """
+    print("\n" + "="*80)
+    print(f"QUERY: {query}")
+    print("="*80 + "\n")
+    
+    # Step 1: Load all sheets
+    print("STEP 1: Loading Excel file...")
+    sheets = read_excel_all_sheets(file_path)
+    
+    # Step 2: Create summary
+    print("\nSTEP 2: Creating workbook summary...")
+    summary = create_workbook_summary(sheets)
+    print(f"✓ Summary created ({len(summary)} characters)\n")
+    
+    # Step 3: Get LLM plan
+    print("STEP 3: Getting extraction plan from LLM...")
+    plan = get_extraction_plan(summary, query)
+    
+    # Step 4: Execute plan algorithmically
+    print("STEP 4: Executing plan algorithmically...")
+    value = execute_plan(sheets, plan)
+    
+    print("\n" + "="*80)
+    print("FINAL RESULT:")
+    print(f"  Value: {value}")
+    print(f"  Type: {type(value).__name__}")
+    print("="*80 + "\n")
+    
     return {
         "query": query,
         "plan": plan,
-        "value": value
+        "value": value,
+        "type": type(value).__name__
     }
 
-if __name__ == "__main__":
-    path = "financial_report_2024.xlsx"
-    query = "What is the total revenue for Q4 2024 across all sheets?"
+# ============================================================================
+# TESTING
+# ============================================================================
 
-    result = answer_query_from_excel(path, query, expected_type="currency")
-    print("PLAN:")
-    print(json.dumps(result["plan"], indent=2))
-    print("\nRESULT VALUE (computed algorithmically):", result["value"])
+if __name__ == "__main__":
+    # Example 1: Single cell lookup
+    result1 = query_excel(
+        "financial_report.xlsx",
+        "What is the total revenue for Q4 2024?"
+    )
+    
+    print(f"Answer: {result1['value']}\n")
+    
+    # Example 2: Sum of range
+    result2 = query_excel(
+        "financial_report.xlsx",
+        "What is the sum of all monthly sales?"
+    )
+    
+    print(f"Answer: {result2['value']}\n")
+    
+    # Example 3: Multiple sheets
+    result3 = query_excel(
+        "financial_report.xlsx",
+        "What is the operating margin percentage?"
+    )
+    
+    print(f"Answer: {result3['value']}\n")
