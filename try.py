@@ -1,6 +1,6 @@
 """
-IMPROVED UNIVERSAL EXCEL FLATTENER - With Data Type Validation
-Properly separates headers from data values using type analysis
+UNIVERSAL EXCEL QUERY ENGINE - Complete Production Version
+Flattens Excel with type validation + Embedding-based semantic search
 """
 
 import pandas as pd
@@ -11,6 +11,8 @@ from dataclasses import dataclass
 import re
 import json
 import openai
+import numpy as np
+from numpy.linalg import norm
 from collections import defaultdict, Counter
 
 
@@ -370,11 +372,9 @@ class ImprovedSheetFlattener:
                     continue
                 
                 # CRITICAL: Skip if this looks like a header cell (text in data area)
-                # This prevents including section headers within the data
                 value_type = self.analyzer.classify_value_type(value)
                 
                 # If cell is pure text and surrounded by numeric cells, it might be a sub-header
-                # Check surrounding cells
                 if value_type == "text" and not self.analyzer.is_numeric_value(value):
                     # Check if this row is mostly text (might be a section header)
                     row_info = self.detector.analyze_row_types(ws, row)
@@ -483,76 +483,153 @@ class ImprovedWorkbookFlattener:
                 ])
         
         print(f"✓ Exported {len(self.flattened_data)} data entries to: {output_path}")
-
-
-# ============================================================================
-# AI SEARCHER (unchanged)
-# ============================================================================
-
-class AISemanticSearcher:
-    """Uses AI to semantically search flattened paths"""
     
-    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+    def export_to_json(self, output_path: str):
+        """Export flattened data to JSON"""
+        data = [entry.to_dict() for entry in self.flattened_data]
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, default=str)
+        
+        print(f"✓ Exported flattened data to: {output_path}")
+
+
+# ============================================================================
+# EMBEDDING-BASED SEMANTIC SEARCHER
+# ============================================================================
+
+class EmbeddingSemanticSearcher:
+    """
+    Proper semantic search using embeddings + cosine similarity.
+    Much more reliable than asking LLM to pick indices.
+    """
+    
+    def __init__(self, api_key: str, model: str = "text-embedding-3-small"):
+        """
+        Initialize with OpenAI API key.
+        Uses text-embedding-3-small (fast, cheap, good quality)
+        """
         self.api_key = api_key
         self.model = model
         openai.api_key = api_key
+        
+        # Cache embeddings to avoid recomputing
+        self.path_embeddings: Optional[np.ndarray] = None
+        self.flattened_ Optional[List[FlattenedCell]] = None
     
-    def search(self, query: str, flattened: List[FlattenedCell], 
-               top_k: int = 10, sample_size: int = 1000) -> List[Tuple[FlattenedCell, str]]:
-        """AI semantic search over flattened paths"""
-        
-        path_list = []
-        sample = flattened[:sample_size] if len(flattened) > sample_size else flattened
-        
-        for i, entry in enumerate(sample):
-            path_list.append(f"{i}: {entry.path} = {entry.value} (type:{entry.value_type})")
-        
-        paths_text = "\n".join(path_list)
-        
-        prompt = f"""You have a flattened Excel database with these DATA entries (headers excluded):
-
-{paths_text}
-
-USER QUERY: {query}
-
-Return ONLY a JSON array of indices matching the query.
-Return top {top_k} matches. These are DATA cells only, not headers.
-
-Example: [45, 123, 67]
-
-JSON response:"""
-
-        response = openai.ChatCompletion.create(
+    def get_embedding(self, text: str) -> np.ndarray:
+        """Get embedding vector for a text string"""
+        response = openai.embeddings.create(
             model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=200
+            input=text
         )
+        return np.array(response.data[0].embedding)
+    
+    def compute_path_embeddings(self, flattened: List[FlattenedCell], verbose: bool = True):
+        """
+        Pre-compute embeddings for all flattened paths.
+        Do this once when loading the workbook.
+        """
+        if verbose:
+            print(f"Computing embeddings for {len(flattened)} paths...")
         
-        result_text = response.choices[0].message.content.strip()
+        # Create searchable text from each entry
+        texts = []
+        for entry in flattened:
+            # Combine path + value for better semantic matching
+            search_text = f"{entry.path}: {entry.value}"
+            texts.append(search_text)
         
-        try:
-            indices = json.loads(result_text)
-        except:
-            indices = [int(x) for x in re.findall(r'\d+', result_text)]
+        # Batch embed (max 2048 texts per batch for OpenAI)
+        batch_size = 2048
+        all_embeddings = []
         
-        matches = []
-        for idx in indices[:top_k]:
-            if 0 <= idx < len(sample):
-                matches.append((sample[idx], f"Match #{len(matches)+1}"))
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            
+            if verbose and len(texts) > batch_size:
+                print(f"  Batch {i//batch_size + 1}/{(len(texts)-1)//batch_size + 1}")
+            
+            response = openai.embeddings.create(
+                model=self.model,
+                input=batch
+            )
+            
+            batch_embeddings = [np.array(item.embedding) for item in response.data]
+            all_embeddings.extend(batch_embeddings)
+        
+        self.path_embeddings = np.array(all_embeddings)
+        self.flattened_data = flattened
+        
+        if verbose:
+            print(f"✓ Computed {len(all_embeddings)} embeddings")
+    
+    def cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Compute cosine similarity between two vectors"""
+        return np.dot(a, b) / (norm(a) * norm(b))
+    
+    def search(self, query: str, top_k: int = 10, verbose: bool = True) -> List[Tuple[FlattenedCell, float]]:
+        """
+        Search for most relevant entries using semantic similarity.
+        
+        Returns:
+            List of (FlattenedCell, similarity_score) tuples, sorted by relevance
+        """
+        if self.path_embeddings is None or self.flattened_data is None:
+            raise ValueError("Must call compute_path_embeddings() first")
+        
+        if verbose:
+            print(f"\nSearching for: '{query}'")
+        
+        # Embed the query
+        query_embedding = self.get_embedding(query)
+        
+        # Compute cosine similarity with all paths
+        similarities = np.array([
+            self.cosine_similarity(query_embedding, path_emb)
+            for path_emb in self.path_embeddings
+        ])
+        
+        # Get top K indices
+        top_indices = np.argsort(similarities)[-top_k:][::-1]
+        
+        # Return matches with scores
+        matches = [
+            (self.flattened_data[idx], float(similarities[idx]))
+            for idx in top_indices
+        ]
+        
+        if verbose:
+            print(f"✓ Top {len(matches)} matches (by similarity score):")
+            for i, (entry, score) in enumerate(matches[:5], 1):
+                print(f"  {i}. Score: {score:.3f} | {entry.path}")
+                print(f"     Value: {entry.value} ({entry.value_type}) [{entry.sheet}!{entry.cell_ref}]")
         
         return matches
 
 
 # ============================================================================
-# VALUE EXTRACTOR (unchanged)
+# VALUE EXTRACTOR
 # ============================================================================
 
 class ValueExtractor:
-    """Extracts values algorithmically"""
+    """Extracts values algorithmically from matches (GUARANTEED PRECISE)"""
     
     @staticmethod
     def extract(matches: List[Tuple[FlattenedCell, str]], operation: str = "return") -> Any:
+        """
+        Extract value(s) algorithmically - NO AI involved.
+        
+        Operations:
+        - return: return first match
+        - sum: sum all numeric matches
+        - average: average all numeric matches
+        - max: maximum value
+        - min: minimum value
+        - count: count matches
+        - list: return all matches
+        """
+        
         if not matches:
             return None
         
@@ -595,7 +672,8 @@ class ValueExtractor:
         elif operation == "list":
             return [m[0].value for m, _ in matches]
         
-        return None
+        else:
+            raise ValueError(f"Unknown operation: {operation}")
 
 
 # ============================================================================
@@ -603,24 +681,45 @@ class ValueExtractor:
 # ============================================================================
 
 class ExcelQueryEngine:
-    """Main query engine with improved flattening"""
+    """
+    Main query engine combining:
+    - Type-aware flattening
+    - Embedding-based semantic search
+    - Algorithmic value extraction
+    """
     
-    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+    def __init__(self, api_key: str, embedding_model: str = "text-embedding-3-small"):
         self.flattener = ImprovedWorkbookFlattener()
-        self.searcher = AISemanticSearcher(api_key, model)
+        self.searcher = EmbeddingSemanticSearcher(api_key, embedding_model)
         self.extractor = ValueExtractor()
         self.flattened_ Optional[List[FlattenedCell]] = None
         self.file_path: Optional[str] = None
     
     def load_workbook(self, file_path: str, verbose: bool = True) -> 'ExcelQueryEngine':
-        """Load and flatten workbook"""
+        """Load and flatten workbook, then compute embeddings"""
         self.file_path = file_path
         self.flattened_data = self.flattener.flatten(file_path, verbose)
+        
+        # Pre-compute embeddings
+        if verbose:
+            print("\nPre-computing embeddings for semantic search...")
+        self.searcher.compute_path_embeddings(self.flattened_data, verbose)
+        
         return self
     
     def query(self, query: str, operation: str = "return", 
-              top_k: int = 10, verbose: bool = True) -> QueryResult:
-        """Query Excel with improved header filtering"""
+              top_k: int = 10, min_similarity: float = 0.0, 
+              verbose: bool = True) -> QueryResult:
+        """
+        Query with embedding-based semantic search.
+        
+        Args:
+            query: Natural language query
+            operation: "return" | "sum" | "average" | "max" | "min" | "count" | "list"
+            top_k: Number of matches to retrieve
+            min_similarity: Minimum similarity score (0.0 to 1.0, default 0.0 = no filter)
+            verbose: Print progress
+        """
         
         if self.flattened_data is None:
             raise ValueError("No workbook loaded. Call load_workbook() first.")
@@ -629,50 +728,115 @@ class ExcelQueryEngine:
             print("\n" + "="*80)
             print(f"QUERY: {query}")
             print(f"OPERATION: {operation}")
-            print("="*80 + "\n")
+            print("="*80)
         
-        matches = self.searcher.search(query, self.flattened_data, top_k)
+        # Embedding-based search
+        matches_with_scores = self.searcher.search(query, top_k, verbose)
         
+        # Filter by minimum similarity if specified
+        if min_similarity > 0:
+            matches_with_scores = [
+                (entry, score) for entry, score in matches_with_scores 
+                if score >= min_similarity
+            ]
+            if verbose:
+                print(f"\n✓ Filtered to {len(matches_with_scores)} matches with similarity >= {min_similarity}")
+        
+        # Convert to old format for extractor (without scores)
+        matches = [(entry, f"Match #{i+1}") for i, (entry, score) in enumerate(matches_with_scores)]
+        
+        # Extract value algorithmically
         if verbose:
-            print(f"✓ Found {len(matches)} matches:")
-            for entry, label in matches[:5]:
-                print(f"  {label}: {entry.path}")
-                print(f"    = {entry.value} (type: {entry.value_type}) [{entry.sheet}!{entry.cell_ref}]")
+            print(f"\nExtracting value (operation: {operation})...")
         
         result = self.extractor.extract(matches, operation)
+        
+        # Calculate confidence based on similarity scores
+        if matches_with_scores:
+            avg_similarity = np.mean([score for _, score in matches_with_scores])
+            confidence = float(avg_similarity)
+        else:
+            confidence = 0.0
         
         if verbose:
             print(f"\n{'='*80}")
             print(f"RESULT: {result}")
+            print(f"CONFIDENCE: {confidence:.3f}")
             print(f"{'='*80}\n")
         
         return QueryResult(
             query=query,
             result=result,
             matches=[(m.path, m.value, m.sheet, m.cell_ref) for m, _ in matches],
-            operation=operation
+            operation=operation,
+            confidence=confidence
         )
     
-    def export_flattened(self, output_path: str):
-        """Export flattened data"""
-        self.flattener.export_to_csv(output_path)
+    def export_flattened(self, output_path: str, format: str = "csv"):
+        """Export flattened data for inspection"""
+        if format == "csv":
+            self.flattener.export_to_csv(output_path)
+        elif format == "json":
+            self.flattener.export_to_json(output_path)
+        else:
+            raise ValueError(f"Unknown format: {format}")
     
     def get_sample_paths(self, n: int = 20) -> List[str]:
-        """Get sample paths"""
+        """Get sample paths for debugging"""
         if self.flattened_data is None:
             return []
         return [entry.path for entry in self.flattened_data[:n]]
 
 
 # ============================================================================
-# USAGE
+# USAGE EXAMPLE
 # ============================================================================
 
 if __name__ == "__main__":
-    engine = ExcelQueryEngine(api_key="your-key")
+    # Initialize engine
+    engine = ExcelQueryEngine(api_key="your-openai-api-key")
+    
+    # Load workbook (flattens + computes embeddings)
     engine.load_workbook("financial_report.xlsx")
     
-    result = engine.query("What is the Q4 2024 revenue?")
-    print(f"\nFinal Answer: {result.result}")
+    # Example 1: Single value lookup
+    result1 = engine.query(
+        "What is the Q4 2024 revenue?",
+        operation="return",
+        min_similarity=0.3
+    )
+    print(f"Answer: {result1.result}")
+    print(f"Confidence: {result1.confidence:.2%}\n")
     
-    engine.export_flattened("flattened_data_only.csv")
+    # Example 2: Sum multiple values
+    result2 = engine.query(
+        "What is the total of all quarterly revenues?",
+        operation="sum",
+        top_k=20
+    )
+    print(f"Answer: {result2.result}\n")
+    
+    # Example 3: Average
+    result3 = engine.query(
+        "What is the average profit margin?",
+        operation="average"
+    )
+    print(f"Answer: {result3.result}\n")
+    
+    # Export flattened structure for debugging
+    engine.export_flattened("flattened_excel.csv")
+    
+    # Show sample paths
+    print("\nSample of flattened paths:")
+    for path in engine.get_sample_paths(10):
+        print(f"  {path}")
+    
+    # Export query results
+    with open("query_results.json", "w") as f:
+        json.dump([
+            result1.to_dict(),
+            result2.to_dict(),
+            result3.to_dict()
+        ], f, indent=2, default=str)
+    
+    print("\n✓ Query results exported to query_results.json")
