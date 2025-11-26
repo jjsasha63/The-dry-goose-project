@@ -1,10 +1,11 @@
 """
-Financial Excel Query Engine V2 (Enterprise Edition)
+Financial Excel Query Engine V3 (Enterprise Edition)
 ----------------------------------------------------
 A production-ready library for querying complex financial Excel files.
+
 Features:
 - Zero Hallucination: Returns exact cell values only.
-- OpenAI Embeddings: Enterprise-grade semantic search (replaces HuggingFace).
+- Hybrid Search: Combines OpenAI Embeddings + Exact Keyword Matching.
 - Advanced Structure Detection: Uses styles (bold/fonts) & layout to find headers.
 - Bank-Grade Precision: Validates data types (e.g., won't return text for 'Revenue').
 """
@@ -38,10 +39,10 @@ class QueryEngineConfig:
     openai_api_key: Optional[str] = field(default_factory=lambda: os.getenv("OPENAI_API_KEY"))
     openai_model: str = "text-embedding-3-small" # Cost-effective, high performance
     
-    # thresholds
+    # Thresholds
     min_confidence: float = 0.4
     
-    # Structure Detection
+    # Structure Detection Settings
     header_text_ratio_threshold: float = 0.6
     style_weight_boost: float = 0.3  # How much 'Bold' text counts towards being a header
     use_style_analysis: bool = True
@@ -95,7 +96,7 @@ class BasicSemanticMatcher(SemanticMatcher):
         union = len(q_tok | t_tok)
         
         # Boost for exact substring matches
-        score = intersection / union
+        score = intersection / union if union > 0 else 0.0
         if query.lower() in target.lower():
             score = max(score, 0.9)
         return score
@@ -120,6 +121,7 @@ class OpenAISemanticMatcher(SemanticMatcher):
         if not texts: return []
         
         # Clean newlines to improve embedding quality
+        # Truncate extremely long text to avoid token limits (8191 limit usually)
         clean_texts = [t.replace("\n", " ")[:8000] for t in texts]
         
         response = self.client.embeddings.create(
@@ -380,43 +382,73 @@ class FinancialExcelEngine:
         if isinstance(val, str): return "text"
         return "unknown"
 
-    def query(self, question: str, top_k=3) -> List[SearchResult]:
-        """Public query interface."""
+    def query(self, question: str, top_k=5) -> List[SearchResult]:
+        """
+        Hybrid Query: Combines Semantic Search (Vectors) with Exact Keyword Matching.
+        """
+        # 1. Setup
+        # Check if user likely wants a number (heuristic)
+        prefer_number = any(x in question.lower() for x in ['how much', 'total', 'cost', 'revenue', 'profit', 'sum'])
         
-        # 1. Infer Intent (simple heuristic)
-        # If question contains "revenue", "cost", "amount" -> prefer numbers
-        prefer_number = any(x in question.lower() for x in ['how much', 'total', 'cost', 'revenue', 'profit'])
+        # Normalize query for keyword matching
+        query_tokens = set(question.lower().split())
         
         scored_results = []
         
+        # 2. Generate Embeddings (if using OpenAI)
         if self.config.semantic_backend == 'openai':
-            # Embed query
             q_vec = self.matcher.embed_batch([question])[0]
-            
-            for r in self.records:
-                target_vec = self.vector_index.get(r['searchable_text'])
-                if target_vec:
-                    score = self.matcher.cosine_similarity(q_vec, target_vec)
-                    scored_results.append((score, r))
         else:
-            # Basic
-            for r in self.records:
-                score = self.matcher.calculate_similarity(question, r['searchable_text'])
-                scored_results.append((score, r))
-        
-        # Sort
-        scored_results.sort(key=lambda x: x[0], reverse=True)
-        
-        # Format Output
-        final_output = []
-        for score, r in scored_results:
-            if score < self.config.min_confidence: continue
+            q_vec = None
+
+        # 3. Score Every Record
+        for r in self.records:
+            # --- A. Semantic Score (Vector/Basic) ---
+            semantic_score = 0.0
+            if self.config.semantic_backend == 'openai':
+                target_vec = self.vector_index.get(r['searchable_text'])
+                if target_vec is not None:
+                    semantic_score = self.matcher.cosine_similarity(q_vec, target_vec)
+            else:
+                semantic_score = self.matcher.calculate_similarity(question, r['searchable_text'])
             
-            # Type penalty (Soft enforcement)
+            # --- B. Keyword Boost (The Fix) ---
+            # Check if query tokens appear strictly in the header path
+            # e.g. Query "2023" vs Header "Revenue > 2023" -> Match!
+            keyword_score = 0.0
+            
+            # Flatten header path to a single lower-case string for checking
+            path_str = " ".join(str(x).lower() for x in r['header_path'])
+            
+            # 1. Exact Substring Match (High Boost)
+            if question.lower() in path_str:
+                keyword_score = 0.95
+            
+            # 2. Token Overlap (Medium Boost)
+            else:
+                path_tokens = set(path_str.split())
+                if path_tokens:
+                    overlap = len(query_tokens & path_tokens)
+                    keyword_score = (overlap / len(query_tokens)) * 0.9  # Max 0.9
+            
+            # --- C. Final Hybrid Score ---
+            # We take the MAXIMUM of Semantic vs Keyword. 
+            # If vector fails but keyword hits, we win. If keyword fails but vector hits (synonyms), we win.
+            final_score = max(semantic_score, keyword_score)
+            
+            # --- D. Type Penalty ---
             # If we want a number but got text (like "See Note 5"), lower score slightly
             if prefer_number and r['type'] != 'number':
-                score *= 0.8
-            
+                final_score *= 0.8
+                
+            if final_score >= self.config.min_confidence:
+                scored_results.append((final_score, r))
+        
+        # 4. Sort and Return
+        scored_results.sort(key=lambda x: x[0], reverse=True)
+        
+        final_output = []
+        for score, r in scored_results:
             res = SearchResult(
                 value=r['value'],
                 confidence=score,
