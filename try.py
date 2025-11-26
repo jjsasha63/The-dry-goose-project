@@ -1,13 +1,13 @@
 """
-Financial Excel Query Engine V3 (Enterprise Edition)
-----------------------------------------------------
+Financial Excel Query Engine V4 (Precision Edition)
+---------------------------------------------------
 A production-ready library for querying complex financial Excel files.
 
 Features:
 - Zero Hallucination: Returns exact cell values only.
-- Hybrid Search: Combines OpenAI Embeddings + Exact Keyword Matching.
-- Advanced Structure Detection: Uses styles (bold/fonts) & layout to find headers.
-- Bank-Grade Precision: Validates data types (e.g., won't return text for 'Revenue').
+- Constraint Enforcement: Strictly enforces years, quarters, and key financial terms.
+- Hybrid Search: Combines OpenAI Embeddings + Weighted Keyword Coverage.
+- Advanced Structure Detection: Uses styles & layout to find multi-level headers.
 """
 
 import os
@@ -15,7 +15,7 @@ import re
 import warnings
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Tuple, Any, Optional, Literal
+from typing import List, Dict, Tuple, Any, Optional, Literal, Set
 from dataclasses import dataclass, field
 from enum import Enum
 from openpyxl import load_workbook
@@ -37,14 +37,14 @@ class QueryEngineConfig:
     
     # OpenAI Settings
     openai_api_key: Optional[str] = field(default_factory=lambda: os.getenv("OPENAI_API_KEY"))
-    openai_model: str = "text-embedding-3-small" # Cost-effective, high performance
+    openai_model: str = "text-embedding-3-small"
     
-    # Thresholds
-    min_confidence: float = 0.4
+    # Search Thresholds
+    min_confidence: float = 0.5  # Slightly higher default for precision
     
     # Structure Detection Settings
     header_text_ratio_threshold: float = 0.6
-    style_weight_boost: float = 0.3  # How much 'Bold' text counts towards being a header
+    style_weight_boost: float = 0.3
     use_style_analysis: bool = True
 
 @dataclass
@@ -55,8 +55,8 @@ class SearchResult:
     sheet_name: str
     row: int
     col: int
-    header_path: List[str]     # Hierarchical path (e.g. ["Assets", "Current", "Cash"])
-    context_text: str          # The full searchable text
+    header_path: List[str]
+    context_text: str
     value_type: str
 
     def __repr__(self):
@@ -81,7 +81,7 @@ class SemanticMatcher:
         raise NotImplementedError
 
 class BasicSemanticMatcher(SemanticMatcher):
-    """Fallback matcher using token overlap (Jaccard)."""
+    """Fallback matcher using token overlap."""
     def normalize(self, text: str) -> set:
         text = str(text).lower().strip()
         text = re.sub(r'[^\w\s]', '', text)
@@ -95,16 +95,13 @@ class BasicSemanticMatcher(SemanticMatcher):
         intersection = len(q_tok & t_tok)
         union = len(q_tok | t_tok)
         
-        # Boost for exact substring matches
         score = intersection / union if union > 0 else 0.0
         if query.lower() in target.lower():
             score = max(score, 0.9)
         return score
 
 class OpenAISemanticMatcher(SemanticMatcher):
-    """
-    Enterprise matcher using OpenAI Embeddings.
-    """
+    """Enterprise matcher using OpenAI Embeddings."""
     def __init__(self, api_key: str, model: str):
         try:
             from openai import OpenAI
@@ -117,11 +114,7 @@ class OpenAISemanticMatcher(SemanticMatcher):
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Embeds a list of strings in one API call."""
         if not texts: return []
-        
-        # Clean newlines to improve embedding quality
-        # Truncate extremely long text to avoid token limits (8191 limit usually)
         clean_texts = [t.replace("\n", " ")[:8000] for t in texts]
         
         response = self.client.embeddings.create(
@@ -148,7 +141,6 @@ class MergedCellHandler:
         self.wb = load_workbook(file_path, data_only=True)
         self.merged_map = {}
         
-        # Pre-calculate merge maps
         for sheet in self.wb.worksheets:
             for group in sheet.merged_cells.ranges:
                 min_row, min_col = group.min_row, group.min_col
@@ -157,11 +149,6 @@ class MergedCellHandler:
                         self.merged_map[(sheet.title, r, c)] = (min_row, min_col)
 
     def get_sheet_data_and_styles(self, sheet_name: str) -> Tuple[pd.DataFrame, List[List[bool]]]:
-        """
-        Returns:
-        1. DataFrame with merged cells filled (forward filled).
-        2. A grid of booleans indicating if a cell is BOLD (for header detection).
-        """
         sheet = self.wb[sheet_name]
         data_rows = []
         bold_grid = []
@@ -170,17 +157,11 @@ class MergedCellHandler:
             row_data = []
             row_bold = []
             for c_idx, cell in enumerate(row, start=1):
-                # Resolve merged cells
                 lookup_r, lookup_c = self.merged_map.get((sheet_name, r_idx, c_idx), (r_idx, c_idx))
                 real_cell = sheet.cell(row=lookup_r, column=lookup_c)
                 
-                # Value
                 row_data.append(real_cell.value)
-                
-                # Style (Check if bold)
-                is_bold = False
-                if real_cell.font and real_cell.font.bold:
-                    is_bold = True
+                is_bold = bool(real_cell.font and real_cell.font.bold)
                 row_bold.append(is_bold)
             
             data_rows.append(row_data)
@@ -194,38 +175,29 @@ class StructureDetector:
         self.config = config
 
     def detect_tables(self, df: pd.DataFrame, bold_grid: List[List[bool]]) -> List[Dict]:
-        """
-        Scans a sheet to find table blocks.
-        Returns metadata about header rows and data boundaries.
-        """
         tables = []
         i = 0
         max_rows = len(df)
 
         while i < max_rows:
-            # Skip empty rows
             if df.iloc[i].isna().all():
                 i += 1
                 continue
 
-            # 1. Detect Header Region
-            # We look for a block of rows that look like headers (Text + Bold)
             header_start = i
             header_end = i
             
-            for r in range(i, min(i + 5, max_rows)): # Look ahead 5 rows max for multi-level header
+            for r in range(i, min(i + 5, max_rows)):
                 row_vals = df.iloc[r]
                 if self._is_header_row(row_vals, bold_grid[r]):
                     header_end = r + 1
                 else:
                     break
             
-            # If we didn't find a header, treat current row as data, or skip
             if header_end == header_start:
                 i += 1
                 continue
             
-            # 2. Detect Data Region (stops at 2 consecutive empty rows)
             data_start = header_end
             data_end = data_start
             empty_counter = 0
@@ -251,17 +223,12 @@ class StructureDetector:
         return tables
 
     def _is_header_row(self, row: pd.Series, bold_row: List[bool]) -> bool:
-        """Decides if a row is a header based on content and style."""
         clean_row = row.dropna()
         if len(clean_row) == 0: return False
         
-        # Metric 1: Text Ratio
         text_count = sum(isinstance(x, str) for x in clean_row)
         text_ratio = text_count / len(clean_row)
         
-        # Metric 2: Style (Bold) Ratio
-        # Map bold_row indices to clean_row indices matches is tricky in pandas, 
-        # so we just count total bold in the raw row vs total non-null
         bold_count = sum(1 for idx, is_bold in enumerate(bold_row) if is_bold and pd.notna(row.iloc[idx]))
         bold_ratio = bold_count / len(clean_row)
         
@@ -276,66 +243,47 @@ class FinancialExcelEngine:
     def __init__(self, file_path: str, config: QueryEngineConfig):
         self.file_path = file_path
         self.config = config
-        self.records = [] # Flattened searchable data
-        self.vector_index = {} # Hash map for embeddings
+        self.records = []
+        self.vector_index = {}
         
-        # Init Components
         self.merge_handler = MergedCellHandler(file_path)
         self.detector = StructureDetector(config)
         
-        # Init Backend
         if config.semantic_backend == 'openai':
             if not config.openai_api_key:
-                raise ValueError("OpenAI API Key missing. Set env var OPENAI_API_KEY or pass in config.")
+                raise ValueError("OpenAI API Key missing.")
             self.matcher = OpenAISemanticMatcher(config.openai_api_key, config.openai_model)
         else:
             self.matcher = BasicSemanticMatcher()
 
-        # Build Index
         print("Parsing file structure...")
         self._ingest_file()
         
         if config.semantic_backend == 'openai':
-            print("Generating embeddings (this may take a moment)...")
+            print("Generating embeddings...")
             self._build_embeddings()
         print("Engine Ready.")
 
     def _ingest_file(self):
-        """Reads file, detects structure, flattens data."""
-        wb = load_workbook(self.file_path, read_only=True) # Just to get sheet names
+        wb = load_workbook(self.file_path, read_only=True)
         
         for sheet_name in wb.sheetnames:
-            # Get clean data + styles
             df, bold_grid = self.merge_handler.get_sheet_data_and_styles(sheet_name)
-            
-            # Detect Tables
             tables = self.detector.detect_tables(df, bold_grid)
             
             for tbl in tables:
                 h_start, h_end = tbl['header_range']
                 d_start, d_end = tbl['data_range']
                 
-                # Process Headers (Handling Multi-level)
-                header_block = df.iloc[h_start:h_end]
-                # Forward fill headers horizontally (e.g. "2023" merged across "Q1", "Q2")
-                header_block = header_block.ffill(axis=1)
-                
-                # Create a "Path" for each column
-                # e.g. Col 3 -> ["Assets", "Current", "Cash"]
+                header_block = df.iloc[h_start:h_end].ffill(axis=1)
                 col_paths = []
                 for c in range(len(df.columns)):
-                    # Get all vertical components of the header
                     raw_path = header_block.iloc[:, c].tolist()
-                    # Clean path (remove NaNs, whitespace)
                     clean_path = [str(p).strip() for p in raw_path if pd.notna(p) and str(p).strip() != ""]
                     col_paths.append(clean_path)
                 
-                # Process Data Rows
                 for r_idx in range(d_start, d_end):
                     row_data = df.iloc[r_idx]
-                    
-                    # Assume first non-empty column is the "Row Label" (e.g. "Total Revenue")
-                    # This is a heuristic, but common in finance.
                     row_label_idx = row_data.first_valid_index()
                     if row_label_idx is None: continue
                     
@@ -343,14 +291,9 @@ class FinancialExcelEngine:
                     
                     for c_idx, val in enumerate(row_data):
                         if pd.isna(val) or c_idx == row_label_idx: continue
-                        
-                        # Construct full semantic path
-                        # Path = Row Label + Column Headers
-                        # e.g. "Total Revenue" + "2023" + "Q1"
-                        full_path = [row_label] + col_paths[c_idx]
-                        
-                        # Skip empty values
                         if str(val).strip() == "": continue
+                        
+                        full_path = [row_label] + col_paths[c_idx]
                         
                         record = {
                             'sheet': sheet_name,
@@ -364,10 +307,7 @@ class FinancialExcelEngine:
                         self.records.append(record)
 
     def _build_embeddings(self, batch_size=50):
-        """Batched embedding generation."""
-        # Only embed unique strings to save tokens
         unique_texts = list(set(r['searchable_text'] for r in self.records))
-        
         for i in range(0, len(unique_texts), batch_size):
             batch = unique_texts[i:i+batch_size]
             try:
@@ -381,70 +321,79 @@ class FinancialExcelEngine:
         if isinstance(val, (int, float)): return "number"
         if isinstance(val, str): return "text"
         return "unknown"
+    
+    def _extract_critical_tokens(self, query: str) -> Set[str]:
+        """Identify tokens that MUST exist (Years, Quarters, specific Codes)."""
+        tokens = set()
+        parts = query.split()
+        for p in parts:
+            clean_p = p.strip().lower()
+            # Regex for Years (19XX or 20XX)
+            if re.match(r'^(19|20)\d{2}$', clean_p):
+                tokens.add(clean_p)
+            # Regex for Quarters (Q1-Q4)
+            elif re.match(r'^q[1-4]$', clean_p):
+                tokens.add(clean_p)
+            # Structural Modifiers
+            elif clean_p in ['total', 'net', 'gross', 'operating', 'ebitda']:
+                tokens.add(clean_p)
+        return tokens
 
     def query(self, question: str, top_k=5) -> List[SearchResult]:
-        """
-        Hybrid Query: Combines Semantic Search (Vectors) with Exact Keyword Matching.
-        """
-        # 1. Setup
-        # Check if user likely wants a number (heuristic)
+        """Precision Query: Strict Constraint Enforcement + Hybrid Scoring."""
+        query_tokens = set(question.lower().split())
+        critical_tokens = self._extract_critical_tokens(question)
         prefer_number = any(x in question.lower() for x in ['how much', 'total', 'cost', 'revenue', 'profit', 'sum'])
         
-        # Normalize query for keyword matching
-        query_tokens = set(question.lower().split())
-        
         scored_results = []
+        q_vec = None
         
-        # 2. Generate Embeddings (if using OpenAI)
         if self.config.semantic_backend == 'openai':
             q_vec = self.matcher.embed_batch([question])[0]
-        else:
-            q_vec = None
 
-        # 3. Score Every Record
         for r in self.records:
-            # --- A. Semantic Score (Vector/Basic) ---
+            target_text = r['searchable_text'].lower()
+            
+            # --- A. Constraint Check ---
+            constraint_penalty = 1.0
+            if critical_tokens:
+                missing_critical = [t for t in critical_tokens if t not in target_text]
+                if missing_critical:
+                    constraint_penalty = 0.1 # Severe penalty for missing year/type
+            
+            # --- B. Semantic Score ---
             semantic_score = 0.0
-            if self.config.semantic_backend == 'openai':
+            if self.config.semantic_backend == 'openai' and q_vec:
                 target_vec = self.vector_index.get(r['searchable_text'])
-                if target_vec is not None:
+                if target_vec:
                     semantic_score = self.matcher.cosine_similarity(q_vec, target_vec)
             else:
                 semantic_score = self.matcher.calculate_similarity(question, r['searchable_text'])
             
-            # --- B. Keyword Boost (The Fix) ---
-            # Check if query tokens appear strictly in the header path
-            # e.g. Query "2023" vs Header "Revenue > 2023" -> Match!
-            keyword_score = 0.0
+            # --- C. Keyword Overlap Score ---
+            target_tokens = set(target_text.split())
+            keyword_coverage = 0.0
+            if query_tokens:
+                intersection = query_tokens.intersection(target_tokens)
+                keyword_coverage = len(intersection) / len(query_tokens)
             
-            # Flatten header path to a single lower-case string for checking
-            path_str = " ".join(str(x).lower() for x in r['header_path'])
+            # --- D. Weighted Blend ---
+            # 65% Semantic (Context) + 35% Keywords (Precision)
+            base_score = (semantic_score * 0.65) + (keyword_coverage * 0.35)
             
-            # 1. Exact Substring Match (High Boost)
-            if question.lower() in path_str:
-                keyword_score = 0.95
-            
-            # 2. Token Overlap (Medium Boost)
-            else:
-                path_tokens = set(path_str.split())
-                if path_tokens:
-                    overlap = len(query_tokens & path_tokens)
-                    keyword_score = (overlap / len(query_tokens)) * 0.9  # Max 0.9
-            
-            # --- C. Final Hybrid Score ---
-            # We take the MAXIMUM of Semantic vs Keyword. 
-            # If vector fails but keyword hits, we win. If keyword fails but vector hits (synonyms), we win.
-            final_score = max(semantic_score, keyword_score)
-            
-            # --- D. Type Penalty ---
-            # If we want a number but got text (like "See Note 5"), lower score slightly
-            if prefer_number and r['type'] != 'number':
-                final_score *= 0.8
+            # Perfect substring boost
+            if question.lower() in target_text:
+                base_score = max(base_score, 0.98)
                 
+            final_score = base_score * constraint_penalty
+            
+            # --- E. Type Validation ---
+            if prefer_number and r['type'] != 'number':
+                final_score *= 0.85
+
             if final_score >= self.config.min_confidence:
                 scored_results.append((final_score, r))
         
-        # 4. Sort and Return
         scored_results.sort(key=lambda x: x[0], reverse=True)
         
         final_output = []
@@ -465,53 +414,48 @@ class FinancialExcelEngine:
         return final_output
 
 # ==========================================
-# 5. Execution Example
+# 5. Example Usage
 # ==========================================
-
 if __name__ == "__main__":
-    # Create a dummy file for demonstration if one doesn't exist
+    # Demo Setup
     dummy_file = "financial_demo.xlsx"
     if not os.path.exists(dummy_file):
         print("Creating dummy financial file...")
         df = pd.DataFrame({
-            'Metric': ['Revenue', 'Cost of Goods', 'Gross Profit'],
-            '2022': [100000, 40000, 60000],
-            '2023': [120000, 45000, 75000]
+            'Metric': ['Revenue', 'Net Income', 'Gross Profit'],
+            '2022': [100, 20, 40],
+            '2023': [120, 25, 50]
         })
-        # Create a simple excel with bold headers
         with pd.ExcelWriter(dummy_file, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Income Statement', index=False)
-            # (Note: Real usage would detect existing bold formatting in your files)
+            df.to_excel(writer, sheet_name='P&L', index=False)
 
-    # --- CONFIGURATION ---
-    # Replace with your actual API key or ensure it's in env vars
+    # Config
     api_key = os.getenv("OPENAI_API_KEY", "sk-placeholder-key")
-    
     config = QueryEngineConfig(
-        semantic_backend='openai', # Change to 'basic' if you don't have a key yet
+        semantic_backend='openai', 
         openai_api_key=api_key,
-        min_confidence=0.75
+        min_confidence=0.6  # High confidence for precision
     )
 
     try:
-        print(f"\nInitializing Engine with {config.semantic_backend} backend...")
+        print("\n--- Initializing Precision Engine ---")
         engine = FinancialExcelEngine(dummy_file, config)
         
-        questions = [
-            "What was the revenue in 2023?",
-            "Gross Profit 2022"
+        # Test Queries
+        queries = [
+            "Revenue 2023",      # Critical token: 2023
+            "Net Income 2022",   # Critical token: Net, 2022
+            "Total Assets"       # Semantic match (if present)
         ]
         
-        for q in questions:
-            print(f"\nQuery: {q}")
+        for q in queries:
+            print(f"\nQuery: '{q}'")
             results = engine.query(q)
             if not results:
-                print("No results found.")
-            for res in results:
-                print(f"  -> Found Value: {res.value}")
-                print(f"     Confidence:  {res.confidence:.4f}")
-                print(f"     Source Path: {' > '.join(res.header_path)}")
+                print("  No results found (Strict constraints applied).")
+            for r in results:
+                print(f"  [Score: {r.confidence:.2f}] {r.value} (Path: {' > '.join(r.header_path)})")
                 
     except Exception as e:
-        print(f"\nError running engine: {e}")
-        print("Note: If using 'openai' backend, ensure you have a valid API key.")
+        print(f"\nError: {e}")
+        print("Ensure you have set OPENAI_API_KEY environment variable.")
