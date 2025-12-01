@@ -1,16 +1,12 @@
 """
-Financial Excel Query Engine V5 (Production-Grade Edition)
------------------------------------------------------------
-A production-ready library for querying complex financial Excel files with
-advanced structure detection and multi-level header support.
+Financial Excel Query Engine V5.1 (Production-Grade with Footnote Filtering)
+-----------------------------------------------------------------------------
+Enhanced with intelligent footnote and annotation removal.
 
-Key Enhancements:
-- Multi-table detection per sheet with smart boundary detection
-- Multi-level HORIZONTAL and VERTICAL header flattening
-- Cell classification (header vs data) using multiple signals
-- Exact match prioritization with boosted scoring
-- Enhanced type validation and constraint enforcement
-- Robust handling of dirty data (empty rows, merged cells, inconsistent formatting)
+New Features:
+- Spatial isolation detection (cells far from data regions)
+- Pattern-based footnote detection (*, Note:, Source:, etc.)
+- Configurable filtering rules
 """
 
 import os
@@ -25,7 +21,6 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Suppress warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 
 # ==========================================
@@ -44,7 +39,7 @@ class QueryEngineConfig:
     
     # Search Thresholds
     min_confidence: float = 0.5
-    exact_match_boost: float = 0.25  # Boost for exact substring matches
+    exact_match_boost: float = 0.25
     
     # Structure Detection Settings
     header_text_ratio_threshold: float = 0.55
@@ -52,9 +47,27 @@ class QueryEngineConfig:
     use_style_analysis: bool = True
     max_header_rows: int = 10
     max_empty_rows_between_tables: int = 3
-    
-    # Cell Classification
     min_numeric_cells_for_data_row: int = 2
+    
+    # Footnote Filtering Settings
+    enable_footnote_filtering: bool = True
+    min_distance_from_ int = 3  # Minimum empty rows/cols from data to consider isolated
+    footnote_patterns: List[str] = field(default_factory=lambda: [
+        r'^\*+',                           # Starts with asterisk(s): *, **, ***
+        r'^\d+\)',                          # Starts with number): 1), 2), 10)
+        r'^\[\d+\]',                        # Footnote reference: [1], [2]
+        r'^note[s]?\s*:',                   # Note: or Notes:
+        r'^source[s]?\s*:',                 # Source: or Sources:
+        r'^see\s+',                         # See also, See note
+        r'^disclaimer\s*:',                 # Disclaimer:
+        r'^assumption[s]?\s*:',             # Assumption: or Assumptions:
+        r'^\(\d+\)',                        # (1), (2), (3)
+        r'^[a-z]\)',                        # a), b), c)
+        r'^\d+\.\s',                        # 1. Note, 2. Source (numbered list)
+        r'^ref[s]?\s*:',                    # Ref: or Refs:
+        r'^legend\s*:',                     # Legend:
+    ])
+    max_footnote_length: int = 500  # Max characters for a footnote (avoid filtering long descriptions)
 
 @dataclass
 class SearchResult:
@@ -76,12 +89,13 @@ class SearchResult:
                 f"loc={self.sheet_name}!R{self.row+1}C{self.col+1} | path='{path}'>")
 
 class CellType(Enum):
-    """Cell classification types based on Microsoft Research taxonomy."""
+    """Cell classification types."""
     HEADER_HORIZONTAL = "header_horizontal"
     HEADER_VERTICAL = "header_vertical"
     DATA_VALUE = "data_value"
     INDEX = "index"
     METADATA = "metadata"
+    FOOTNOTE = "footnote"
     EMPTY = "empty"
 
 class ValueType(Enum):
@@ -93,7 +107,124 @@ class ValueType(Enum):
     ANY = "any"
 
 # ==========================================
-# 2. Semantic Matching Backends
+# 2. Footnote Detection & Filtering
+# ==========================================
+
+class FootnoteFilter:
+    """Intelligent footnote and annotation detector [web:11][web:16]."""
+    
+    def __init__(self, config: QueryEngineConfig):
+        self.config = config
+        self.compiled_patterns = [re.compile(pattern, re.IGNORECASE) for pattern in config.footnote_patterns]
+    
+    def is_footnote_by_pattern(self, value: Any) -> bool:
+        """Check if cell matches footnote patterns."""
+        if not isinstance(value, str):
+            return False
+        
+        value_stripped = value.strip()
+        
+        # Empty or very short strings are not footnotes
+        if len(value_stripped) < 2:
+            return False
+        
+        # Too long to be a typical footnote marker/label
+        if len(value_stripped) > self.config.max_footnote_length:
+            return False
+        
+        # Check against all patterns
+        for pattern in self.compiled_patterns:
+            if pattern.match(value_stripped):
+                return True
+        
+        return False
+    
+    def detect_data_boundaries(self, df: pd.DataFrame) -> Dict[str, int]:
+        """Find the bounding box of actual data content."""
+        # Find first and last non-empty row
+        non_empty_rows = [i for i in range(len(df)) if not df.iloc[i].isna().all()]
+        
+        if not non_empty_rows:
+            return {'min_row': 0, 'max_row': 0, 'min_col': 0, 'max_col': 0}
+        
+        min_row = min(non_empty_rows)
+        max_row = max(non_empty_rows)
+        
+        # Find first and last non-empty column
+        non_empty_cols = [i for i in range(len(df.columns)) if not df.iloc[:, i].isna().all()]
+        
+        min_col = min(non_empty_cols) if non_empty_cols else 0
+        max_col = max(non_empty_cols) if non_empty_cols else 0
+        
+        return {
+            'min_row': min_row,
+            'max_row': max_row,
+            'min_col': min_col,
+            'max_col': max_col
+        }
+    
+    def is_spatially_isolated(self, row_idx: int, col_idx: int, 
+                             boundaries: Dict[str, int], 
+                             df: pd.DataFrame) -> bool:
+        """Check if cell is spatially disconnected from main data region."""
+        
+        # Check vertical distance from data
+        vertical_distance = min(
+            abs(row_idx - boundaries['min_row']),
+            abs(row_idx - boundaries['max_row'])
+        )
+        
+        # Check horizontal distance from data
+        horizontal_distance = min(
+            abs(col_idx - boundaries['min_col']),
+            abs(col_idx - boundaries['max_col'])
+        )
+        
+        # Cell is isolated if it's far from both dimensions
+        is_vertically_isolated = vertical_distance >= self.config.min_distance_from_data
+        is_horizontally_isolated = horizontal_distance >= self.config.min_distance_from_data
+        
+        # Additional check: Is it in a sparse region?
+        in_sparse_region = self._is_in_sparse_region(row_idx, col_idx, df)
+        
+        return (is_vertically_isolated or is_horizontally_isolated) and in_sparse_region
+    
+    def _is_in_sparse_region(self, row_idx: int, col_idx: int, 
+                            df: pd.DataFrame, window: int = 2) -> bool:
+        """Check if cell is surrounded by mostly empty cells."""
+        row_start = max(0, row_idx - window)
+        row_end = min(len(df), row_idx + window + 1)
+        col_start = max(0, col_idx - window)
+        col_end = min(len(df.columns), col_idx + window + 1)
+        
+        region = df.iloc[row_start:row_end, col_start:col_end]
+        non_empty_count = region.notna().sum().sum()
+        total_cells = region.size
+        
+        # If less than 30% of surrounding cells are filled, it's sparse
+        return (non_empty_count / total_cells) < 0.3 if total_cells > 0 else True
+    
+    def should_filter_cell(self, value: Any, row_idx: int, col_idx: int,
+                          boundaries: Dict[str, int], df: pd.DataFrame) -> bool:
+        """Determine if a cell should be filtered as footnote/annotation."""
+        
+        if not self.config.enable_footnote_filtering:
+            return False
+        
+        # Check pattern match
+        if self.is_footnote_by_pattern(value):
+            return True
+        
+        # Check spatial isolation (only for text cells)
+        if isinstance(value, str):
+            if self.is_spatially_isolated(row_idx, col_idx, boundaries, df):
+                # Additional heuristic: isolated single cells with text are likely notes
+                return True
+        
+        return False
+
+# ==========================================
+# 3. Semantic Matching Backends
 # ==========================================
 
 class SemanticMatcher:
@@ -112,7 +243,6 @@ class BasicSemanticMatcher(SemanticMatcher):
         q_lower = query.lower()
         t_lower = target.lower()
         
-        # Exact substring match gets very high score
         if q_lower in t_lower or t_lower in q_lower:
             return 0.95
         
@@ -124,14 +254,12 @@ class BasicSemanticMatcher(SemanticMatcher):
         union = len(q_tok | t_tok)
         
         jaccard = intersection / union if union > 0 else 0.0
-        
-        # Token coverage bonus
         coverage = intersection / len(q_tok) if q_tok else 0.0
         
         return max(jaccard, coverage * 0.9)
 
 class OpenAISemanticMatcher(SemanticMatcher):
-    """Enterprise matcher using OpenAI Embeddings with exact match detection."""
+    """Enterprise matcher using OpenAI Embeddings."""
     def __init__(self, api_key: str, model: str):
         try:
             from openai import OpenAI
@@ -162,7 +290,7 @@ class OpenAISemanticMatcher(SemanticMatcher):
         return float(np.dot(a, b) / (norm_a * norm_b))
 
 # ==========================================
-# 3. Structure & Data Handling
+# 4. Structure & Data Handling
 # ==========================================
 
 class MergedCellHandler:
@@ -179,7 +307,7 @@ class MergedCellHandler:
                         self.merged_map[(sheet.title, r, c)] = (min_row, min_col)
 
     def get_sheet_data_and_styles(self, sheet_name: str) -> Tuple[pd.DataFrame, List[List[Dict]]]:
-        """Returns dataframe and style grid with bold, font_size, alignment info."""
+        """Returns dataframe and style grid."""
         sheet = self.wb[sheet_name]
         data_rows = []
         style_grid = []
@@ -207,7 +335,7 @@ class MergedCellHandler:
         return pd.DataFrame(data_rows), style_grid
 
 class CellClassifier:
-    """Classifies cells as headers vs data using multiple signals [web:1][web:2]."""
+    """Classifies cells as headers vs data using multiple signals."""
     def __init__(self, config: QueryEngineConfig):
         self.config = config
     
@@ -217,21 +345,17 @@ class CellClassifier:
         if pd.isna(value) or str(value).strip() == "":
             return CellType.EMPTY
         
-        # Style-based signals
         is_bold = style.get('bold', False)
         font_size = style.get('font_size', 11)
         is_merged = style.get('is_merged', False)
         alignment = style.get('alignment', None)
         
-        # Content-based signals
         is_text = isinstance(value, str)
         is_numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
         
-        # Context-based signals
         row_has_mostly_text = self._row_has_mostly_text(row_data)
         col_has_mostly_numbers = self._col_has_mostly_numbers(col_data)
         
-        # Header scoring [web:2][web:7]
         header_score = 0.0
         if is_bold: header_score += 0.3
         if font_size > 11: header_score += 0.2
@@ -240,7 +364,6 @@ class CellClassifier:
         if row_has_mostly_text: header_score += 0.15
         if alignment == 'center': header_score += 0.1
         
-        # Classification logic
         if header_score >= 0.5:
             if col_idx <= 2 and not col_has_mostly_numbers:
                 return CellType.HEADER_VERTICAL
@@ -255,21 +378,19 @@ class CellClassifier:
         return CellType.DATA_VALUE
     
     def _row_has_mostly_text(self, row: pd.Series) -> bool:
-        """Check if row contains mostly text values."""
         clean = row.dropna()
         if len(clean) == 0: return False
         text_count = sum(isinstance(x, str) for x in clean)
         return (text_count / len(clean)) >= 0.6
     
     def _col_has_mostly_numbers(self, col: pd.Series) -> bool:
-        """Check if column contains mostly numeric values."""
         clean = col.dropna()
         if len(clean) == 0: return False
         num_count = sum(isinstance(x, (int, float)) and not isinstance(x, bool) for x in clean)
         return (num_count / len(clean)) >= 0.6
 
 class AdvancedStructureDetector:
-    """Enhanced table detection with multi-level header support [web:1][web:6]."""
+    """Enhanced table detection with multi-level header support."""
     def __init__(self, config: QueryEngineConfig):
         self.config = config
         self.classifier = CellClassifier(config)
@@ -281,12 +402,10 @@ class AdvancedStructureDetector:
         max_rows = len(df)
 
         while i < max_rows:
-            # Skip empty rows
             if df.iloc[i].isna().all():
                 i += 1
                 continue
 
-            # Detect header block
             header_start = i
             header_end = self._find_header_end(df, style_grid, i)
             
@@ -294,12 +413,10 @@ class AdvancedStructureDetector:
                 i += 1
                 continue
             
-            # Detect data block
             data_start = header_end
             data_end = self._find_data_end(df, data_start)
             
             if data_end > data_start:
-                # Detect vertical headers (row labels)
                 vertical_header_cols = self._detect_vertical_headers(
                     df.iloc[data_start:data_end], 
                     [style_grid[r] for r in range(data_start, data_end)]
@@ -318,7 +435,7 @@ class AdvancedStructureDetector:
         return tables
 
     def _find_header_end(self, df: pd.DataFrame, style_grid: List[List[Dict]], start: int) -> int:
-        """Find the end of multi-level header rows [web:2]."""
+        """Find the end of multi-level header rows."""
         end = start
         max_rows = min(start + self.config.max_header_rows, len(df))
         
@@ -329,10 +446,8 @@ class AdvancedStructureDetector:
             if self._is_header_row(row_vals, row_styles, df):
                 end = r + 1
             else:
-                # Check if it's the start of data
                 if self._is_data_row(row_vals):
                     break
-                # Might be a separator row
                 elif row_vals.isna().all():
                     continue
                 else:
@@ -341,28 +456,23 @@ class AdvancedStructureDetector:
         return end
     
     def _is_header_row(self, row: pd.Series, styles: List[Dict], df: pd.DataFrame) -> bool:
-        """Determine if row is a header using multiple signals [web:2][web:7]."""
+        """Determine if row is a header using multiple signals."""
         clean_row = row.dropna()
         if len(clean_row) == 0: return False
         
-        # Signal 1: Text ratio
         text_count = sum(isinstance(x, str) for x in clean_row)
         text_ratio = text_count / len(clean_row)
         
-        # Signal 2: Bold ratio
         bold_count = sum(1 for idx, style in enumerate(styles) 
                         if idx < len(row) and pd.notna(row.iloc[idx]) and style.get('bold', False))
         bold_ratio = bold_count / len(clean_row) if len(clean_row) > 0 else 0
         
-        # Signal 3: Merged cells
         merged_count = sum(1 for style in styles if style.get('is_merged', False))
         merged_ratio = merged_count / len(styles) if len(styles) > 0 else 0
         
-        # Signal 4: Font size
         avg_font_size = np.mean([s.get('font_size', 11) for s in styles])
         font_boost = 0.1 if avg_font_size > 11 else 0
         
-        # Composite score
         header_score = (text_ratio * 0.4) + (bold_ratio * 0.3) + (merged_ratio * 0.2) + font_boost
         
         return header_score >= self.config.header_text_ratio_threshold
@@ -394,56 +504,51 @@ class AdvancedStructureDetector:
     
     def _detect_vertical_headers(self, data_block: pd.DataFrame, 
                                  style_block: List[List[Dict]]) -> List[int]:
-        """Detect which columns are vertical headers (row labels) [web:1]."""
+        """Detect which columns are vertical headers (row labels)."""
         vertical_cols = []
         
-        for col_idx in range(min(3, len(data_block.columns))):  # Check first 3 columns
+        for col_idx in range(min(3, len(data_block.columns))):
             col_data = data_block.iloc[:, col_idx]
             col_styles = [row[col_idx] if col_idx < len(row) else {} for row in style_block]
             
-            # Text dominant
             text_ratio = sum(isinstance(x, str) for x in col_data.dropna()) / max(len(col_data.dropna()), 1)
-            
-            # Bold cells
             bold_count = sum(1 for s in col_styles if s.get('bold', False))
             bold_ratio = bold_count / max(len(col_styles), 1)
-            
-            # Indentation detection (for hierarchical row labels)
             has_indentation = any(isinstance(v, str) and (v.startswith('  ') or v.startswith('\t')) 
                                  for v in col_data if pd.notna(v))
             
             if text_ratio >= 0.7 or (text_ratio >= 0.5 and bold_ratio >= 0.3) or has_indentation:
                 vertical_cols.append(col_idx)
         
-        return vertical_cols if vertical_cols else [0]  # Default to first column
+        return vertical_cols if vertical_cols else [0]
     
     def _infer_table_name(self, df: pd.DataFrame, header_start: int, header_end: int) -> str:
         """Try to infer a meaningful table name."""
-        # Check rows above header for title
         for r in range(max(0, header_start - 3), header_start):
             row = df.iloc[r]
             non_empty = row.dropna()
-            if len(non_empty) == 1:  # Single cell might be title
+            if len(non_empty) == 1:
                 return str(non_empty.iloc[0])
         
-        # Use first header cell as fallback
         first_header = df.iloc[header_start].dropna()
         return str(first_header.iloc[0]) if len(first_header) > 0 else "Table"
 
 # ==========================================
-# 4. Main Engine
+# 5. Main Engine
 # ==========================================
 
 class FinancialExcelEngine:
-    """Production-grade Financial Excel Query Engine."""
+    """Production-grade Financial Excel Query Engine with Footnote Filtering."""
     def __init__(self, file_path: str, config: QueryEngineConfig):
         self.file_path = file_path
         self.config = config
         self.records = []
         self.vector_index = {}
+        self.filtered_footnotes = []  # Track what was filtered
         
         self.merge_handler = MergedCellHandler(file_path)
         self.detector = AdvancedStructureDetector(config)
+        self.footnote_filter = FootnoteFilter(config)
         
         if config.semantic_backend == 'openai':
             if not config.openai_api_key:
@@ -460,47 +565,59 @@ class FinancialExcelEngine:
             self._build_embeddings()
         
         print(f"✅ Engine Ready. Indexed {len(self.records)} data points across {len(set(r['sheet'] for r in self.records))} sheets.")
+        if self.config.enable_footnote_filtering:
+            print(f"🗑️  Filtered {len(self.filtered_footnotes)} footnote/annotation cells.")
 
     def _ingest_file(self):
-        """Parse all sheets and extract structured data with multi-level headers."""
+        """Parse all sheets and extract structured data with footnote filtering."""
         wb = load_workbook(self.file_path, read_only=True)
         
         for sheet_name in wb.sheetnames:
             df, style_grid = self.merge_handler.get_sheet_data_and_styles(sheet_name)
+            
+            # Detect data boundaries for spatial analysis
+            boundaries = self.footnote_filter.detect_data_boundaries(df)
+            
             tables = self.detector.detect_tables(df, style_grid)
             
             print(f"  📊 {sheet_name}: Found {len(tables)} table(s)")
             
             for tbl_idx, tbl in enumerate(tables):
-                self._process_table(df, style_grid, sheet_name, tbl, tbl_idx)
+                self._process_table(df, style_grid, sheet_name, tbl, tbl_idx, boundaries)
 
     def _process_table(self, df: pd.DataFrame, style_grid: List[List[Dict]], 
-                      sheet_name: str, table: Dict, table_idx: int):
-        """Process a single table and extract all data points."""
+                      sheet_name: str, table: Dict, table_idx: int, 
+                      boundaries: Dict[str, int]):
+        """Process a single table and extract all data points with footnote filtering."""
         h_start, h_end = table['header_range']
         d_start, d_end = table['data_range']
         v_header_cols = table['vertical_header_cols']
         
-        # Build horizontal header paths (multi-level)
         header_block = df.iloc[h_start:h_end]
         col_paths = self._build_column_paths(header_block)
         
-        # Process data rows
         for r_idx in range(d_start, d_end):
             row_data = df.iloc[r_idx]
-            
-            # Build vertical header path (row labels)
             row_path = self._build_row_path(row_data, v_header_cols)
             
             if not row_path:
                 continue
             
-            # Extract values from non-header columns
             for c_idx, val in enumerate(row_data):
                 if c_idx in v_header_cols or pd.isna(val) or str(val).strip() == "":
                     continue
                 
-                # Combine row path + column path
+                # 🔥 FOOTNOTE FILTERING
+                if self.footnote_filter.should_filter_cell(val, r_idx, c_idx, boundaries, df):
+                    self.filtered_footnotes.append({
+                        'sheet': sheet_name,
+                        'row': r_idx,
+                        'col': c_idx,
+                        'value': val,
+                        'reason': 'pattern_match' if self.footnote_filter.is_footnote_by_pattern(val) else 'spatial_isolation'
+                    })
+                    continue  # Skip this cell
+                
                 full_path = row_path + col_paths[c_idx]
                 
                 record = {
@@ -516,14 +633,13 @@ class FinancialExcelEngine:
                 self.records.append(record)
     
     def _build_column_paths(self, header_block: pd.DataFrame) -> List[List[str]]:
-        """Build hierarchical paths for each column from multi-level headers [web:2]."""
+        """Build hierarchical paths for each column from multi-level headers."""
         col_paths = []
-        header_block_ffill = header_block.ffill(axis=1)  # Forward fill merged cells
+        header_block_ffill = header_block.ffill(axis=1)
         
         for c in range(len(header_block.columns)):
             col_headers = header_block_ffill.iloc[:, c].tolist()
             
-            # Clean and deduplicate while preserving order
             clean_path = []
             for h in col_headers:
                 h_str = str(h).strip()
@@ -535,7 +651,7 @@ class FinancialExcelEngine:
         return col_paths
     
     def _build_row_path(self, row_ pd.Series, v_header_cols: List[int]) -> List[str]:
-        """Build hierarchical path from vertical headers (supports indented hierarchies)."""
+        """Build hierarchical path from vertical headers."""
         path = []
         
         for col_idx in v_header_cols:
@@ -544,11 +660,9 @@ class FinancialExcelEngine:
                 if pd.notna(val):
                     val_str = str(val).strip()
                     if val_str:
-                        # Handle indentation (indicates hierarchy level)
                         val_clean = val_str.lstrip()
                         indent_level = len(val_str) - len(val_clean)
                         
-                        # Remove previous path elements if indented (new hierarchy level)
                         if indent_level > 0 and len(path) > 0:
                             path = path[:-1]
                         
@@ -574,37 +688,31 @@ class FinancialExcelEngine:
         if isinstance(val, bool):
             return "boolean"
         if isinstance(val, (int, float)):
-            # Check for percentage
             if isinstance(val, float) and 0 <= abs(val) <= 1:
                 return "percentage"
             return "number"
         if isinstance(val, str):
-            # Check for currency symbols
             if any(sym in val for sym in ['$', '€', '£', '¥']):
                 return "currency"
             return "text"
         return "unknown"
     
     def _extract_critical_tokens(self, query: str) -> Set[str]:
-        """Identify tokens that MUST exist (Years, Quarters, specific terms)."""
+        """Identify tokens that MUST exist."""
         tokens = set()
         query_lower = query.lower()
         parts = query_lower.split()
         
         for p in parts:
             clean_p = p.strip()
-            # Years (1900-2099)
             if re.match(r'^(19|20)\d{2}$', clean_p):
                 tokens.add(clean_p)
-            # Quarters
             elif re.match(r'^q[1-4]$', clean_p):
                 tokens.add(clean_p)
-            # Months
             elif clean_p in ['january', 'february', 'march', 'april', 'may', 'june',
                            'july', 'august', 'september', 'october', 'november', 'december',
                            'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']:
                 tokens.add(clean_p)
-            # Financial modifiers
             elif clean_p in ['total', 'net', 'gross', 'operating', 'ebitda', 'ebit', 
                            'consolidated', 'adjusted', 'actual', 'budget', 'forecast']:
                 tokens.add(clean_p)
@@ -612,19 +720,11 @@ class FinancialExcelEngine:
         return tokens
 
     def query(self, question: str, top_k: int = 5, require_exact_tokens: bool = True) -> List[SearchResult]:
-        """
-        Precision Query with exact match prioritization and hybrid scoring.
-        
-        Args:
-            question: Natural language query
-            top_k: Number of results to return
-            require_exact_tokens: If True, strictly enforce critical token matching
-        """
+        """Precision Query with exact match prioritization and hybrid scoring."""
         query_lower = question.lower()
         query_tokens = set(query_lower.split())
         critical_tokens = self._extract_critical_tokens(question)
         
-        # Detect expected value type from query
         prefer_number = any(kw in query_lower for kw in 
                           ['how much', 'total', 'cost', 'revenue', 'profit', 'sum', 'amount', 'value'])
         
@@ -640,20 +740,17 @@ class FinancialExcelEngine:
         for r in self.records:
             target_text = r['searchable_text'].lower()
             
-            # === A. EXACT MATCH CHECK (HIGHEST PRIORITY) ===
             is_exact = query_lower in target_text
             
-            # === B. CONSTRAINT CHECK ===
             constraint_penalty = 1.0
             if critical_tokens:
                 missing_critical = [t for t in critical_tokens if t not in target_text]
                 if missing_critical:
                     if require_exact_tokens:
-                        constraint_penalty = 0.05  # Severe penalty
+                        constraint_penalty = 0.05
                     else:
-                        constraint_penalty = 0.4  # Moderate penalty
+                        constraint_penalty = 0.4
             
-            # === C. SEMANTIC SIMILARITY ===
             semantic_score = 0.0
             if self.config.semantic_backend == 'openai' and q_vec:
                 target_vec = self.vector_index.get(r['searchable_text'])
@@ -662,35 +759,27 @@ class FinancialExcelEngine:
             else:
                 semantic_score = self.matcher.calculate_similarity(question, r['searchable_text'])
             
-            # === D. KEYWORD COVERAGE ===
             target_tokens = set(target_text.split())
             keyword_coverage = 0.0
             if query_tokens:
                 intersection = query_tokens.intersection(target_tokens)
                 keyword_coverage = len(intersection) / len(query_tokens)
             
-            # === E. WEIGHTED BLEND ===
-            # 60% Semantic (context) + 40% Keywords (precision)
             base_score = (semantic_score * 0.6) + (keyword_coverage * 0.4)
             
-            # === F. EXACT MATCH BOOST ===
             if is_exact:
                 base_score = min(0.99, base_score + self.config.exact_match_boost)
             
-            # Apply constraint penalty
             final_score = base_score * constraint_penalty
             
-            # === G. TYPE VALIDATION ===
             if prefer_number and r['type'] not in ['number', 'percentage', 'currency']:
                 final_score *= 0.75
             
             if final_score >= self.config.min_confidence:
                 scored_results.append((final_score, r, is_exact))
         
-        # Sort: Exact matches first, then by score
         scored_results.sort(key=lambda x: (not x[2], -x[0]))
         
-        # Build results
         final_output = []
         for score, r, is_exact in scored_results[:top_k]:
             res = SearchResult(
@@ -717,89 +806,84 @@ class FinancialExcelEngine:
             'total_records': len(self.records),
             'sheets': len(sheets),
             'tables': len(tables),
+            'filtered_footnotes': len(self.filtered_footnotes),
             'value_types': {vtype: sum(1 for r in self.records if r['type'] == vtype) 
                           for vtype in set(r['type'] for r in self.records)}
         }
+    
+    def get_filtered_footnotes(self, sheet_name: Optional[str] = None) -> List[Dict]:
+        """Get list of filtered footnote cells for debugging [web:16]."""
+        if sheet_name:
+            return [f for f in self.filtered_footnotes if f['sheet'] == sheet_name]
+        return self.filtered_footnotes
 
 # ==========================================
-# 5. Example Usage & Testing
+# 6. Example Usage & Testing
 # ==========================================
 if __name__ == "__main__":
-    # Demo Setup
-    dummy_file = "financial_demo_advanced.xlsx"
+    dummy_file = "financial_demo_with_footnotes.xlsx"
     
     if not os.path.exists(dummy_file):
-        print("📝 Creating advanced demo financial file...")
+        print("📝 Creating demo financial file with footnotes...")
         
-        # Create a realistic multi-level header P&L
         with pd.ExcelWriter(dummy_file, engine='openpyxl') as writer:
-            # Sheet 1: P&L with multi-level headers
+            # P&L with footnotes
             data = {
                 'Line Item': ['Revenue', '  Product Sales', '  Service Revenue', 'Total Revenue',
                              'Expenses', '  COGS', '  Operating Expenses', 'Total Expenses',
-                             'Net Income'],
-                'Q1 2023': [100, 60, 40, 100, 70, 40, 30, 70, 30],
-                'Q2 2023': [120, 70, 50, 120, 80, 45, 35, 80, 40],
-                'Q3 2023': [110, 65, 45, 110, 75, 42, 33, 75, 35],
-                'Q4 2023': [130, 75, 55, 130, 85, 48, 37, 85, 45]
+                             'Net Income', '', '', '* Excluding one-time charges',
+                             'Note: All figures in millions', 'Source: Internal reports'],
+                'Q1 2023': [100, 60, 40, 100, 70, 40, 30, 70, 30, None, None, None, None, None],
+                'Q2 2023': [120, 70, 50, 120, 80, 45, 35, 80, 40, None, None, None, None, None],
+                'Q3 2023': [110, 65, 45, 110, 75, 42, 33, 75, 35, None, None, None, None, None],
+                'Q4 2023': [130, 75, 55, 130, 85, 48, 37, 85, 45, None, None, None, None, None]
             }
             df = pd.DataFrame(data)
             df.to_excel(writer, sheet_name='P&L Statement', index=False)
-            
-            # Sheet 2: Balance Sheet
-            bs_data = {
-                'Account': ['Assets', '  Current Assets', '    Cash', '    Receivables',
-                           '  Fixed Assets', 'Total Assets',
-                           'Liabilities', '  Current Liabilities', '  Long-term Debt',
-                           'Total Liabilities', 'Equity'],
-                '2022': [500, 200, 100, 100, 300, 500, 200, 100, 100, 200, 300],
-                '2023': [600, 250, 120, 130, 350, 600, 220, 110, 110, 220, 380]
-            }
-            df_bs = pd.DataFrame(bs_data)
-            df_bs.to_excel(writer, sheet_name='Balance Sheet', index=False)
 
-    # Configuration
     api_key = os.getenv("OPENAI_API_KEY", "")
     
     config = QueryEngineConfig(
         semantic_backend='openai' if api_key else 'basic',
         openai_api_key=api_key if api_key else None,
         min_confidence=0.45,
-        exact_match_boost=0.30
+        exact_match_boost=0.30,
+        enable_footnote_filtering=True,
+        min_distance_from_data=2
     )
 
     try:
         print("\n" + "="*60)
-        print("🚀 Initializing Production-Grade Financial Excel Engine")
+        print("🚀 Financial Excel Engine with Footnote Filtering")
         print("="*60 + "\n")
         
         engine = FinancialExcelEngine(dummy_file, config)
         
-        # Display statistics
         stats = engine.get_statistics()
         print(f"\n📊 Engine Statistics:")
         print(f"   Total Records: {stats['total_records']}")
-        print(f"   Sheets: {stats['sheets']}")
-        print(f"   Tables: {stats['tables']}")
+        print(f"   Filtered Footnotes: {stats['filtered_footnotes']}")
         print(f"   Value Types: {stats['value_types']}")
         
-        # Test Queries
+        # Show filtered footnotes
+        footnotes = engine.get_filtered_footnotes()
+        if footnotes:
+            print(f"\n🗑️  Filtered Footnotes/Annotations:")
+            for fn in footnotes[:5]:
+                print(f"   - {fn['value'][:60]}... (Reason: {fn['reason']})")
+        
         print("\n" + "="*60)
         print("🔎 Running Test Queries")
         print("="*60)
         
         test_queries = [
-            ("Revenue Q1 2023", "Should find exact Q1 2023 revenue"),
-            ("Net Income Q4 2023", "Should find Q4 net income with exact match"),
-            ("Total Assets 2023", "Should find 2023 total assets"),
-            ("Service Revenue second quarter 2023", "Should match Q2 service revenue"),
-            ("Cash position in 2022", "Should find 2022 cash"),
-            ("What is the operating expenses?", "Should handle question format"),
+            "Revenue Q1 2023",
+            "Net Income Q4 2023",
+            "Service Revenue second quarter 2023",
         ]
         
-        for query, description in test_queries:
+        for query in test_queries:
             print(f"\n📌 Query: '{query}'")
-            print(f"   Expected: {description}")
             results = engine.query(query, top_k=3)
             
             if not results:
@@ -812,15 +896,8 @@ if __name__ == "__main__":
                     print(f"       Value: {r.value} ({r.value_type})")
                     print(f"       Confidence: {r.confidence:.3f}")
                     print(f"       Path: {path_str}")
-                    print(f"       Location: {r.sheet_name}!R{r.row+1}C{r.col+1}")
                 
     except Exception as e:
         print(f"\n❌ Error: {e}")
         if "API" in str(e):
-            print("\n💡 Tip: Set OPENAI_API_KEY environment variable for semantic search.")
-            print("   Falling back to basic keyword matching...")
-            
-            # Retry with basic backend
-            config.semantic_backend = 'basic'
-            engine = FinancialExcelEngine(dummy_file, config)
-            print("\n✅ Engine initialized with basic keyword matching")
+            print("\n💡 Tip: Set OPENAI_API_KEY for semantic search.")
