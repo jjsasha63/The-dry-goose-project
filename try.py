@@ -1,13 +1,7 @@
 """
-Financial Excel Query Engine V4 (Precision Edition)
----------------------------------------------------
-A production-ready library for querying complex financial Excel files.
-
-Features:
-- Zero Hallucination: Returns exact cell values only.
-- Constraint Enforcement: Strictly enforces years, quarters, and key financial terms.
-- Hybrid Search: Combines OpenAI Embeddings + Weighted Keyword Coverage.
-- Advanced Structure Detection: Uses styles & layout to find multi-level headers.
+Financial Excel Query Engine V5 (Advanced Structure Edition)
+------------------------------------------------------------
+Enhanced header detection with location context, bounding boxes, and row header logic.
 """
 
 import os
@@ -15,41 +9,51 @@ import re
 import warnings
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Tuple, Any, Optional, Literal, Set
+from typing import List, Dict, Tuple, Any, Optional, Literal, Set, NamedTuple
 from dataclasses import dataclass, field
 from enum import Enum
 from openpyxl import load_workbook
 from openpyxl.styles import Font
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Suppress warnings for cleaner output
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 
 # ==========================================
-# 1. Configuration & Data Structures
+# 1. Enhanced Data Structures
 # ==========================================
 
 @dataclass
+class TableBounds:
+    """Explicit table boundaries with location context."""
+    sheet_name: str
+    top_row: int
+    bottom_row: int
+    left_col: int
+    right_col: int
+    header_rows: int
+
+@dataclass
+class CellRole:
+    """Cell classification for precise handling."""
+    row: int
+    col: int
+    value: Any
+    role: str  # 'column_header', 'row_header', 'value', 'empty'
+    is_bold: bool
+    table_id: Optional[int]
+
+@dataclass
 class QueryEngineConfig:
-    """Configuration for the engine."""
-    # Backend: 'openai' (recommended) or 'basic' (keyword match only)
     semantic_backend: Literal['basic', 'openai'] = 'openai'
-    
-    # OpenAI Settings
     openai_api_key: Optional[str] = field(default_factory=lambda: os.getenv("OPENAI_API_KEY"))
     openai_model: str = "text-embedding-3-small"
-    
-    # Search Thresholds
-    min_confidence: float = 0.5  # Slightly higher default for precision
-    
-    # Structure Detection Settings
+    min_confidence: float = 0.5
     header_text_ratio_threshold: float = 0.6
     style_weight_boost: float = 0.3
-    use_style_analysis: bool = True
+    numeric_row_string_threshold: float = 0.3  # Max string ratio for numeric rows
 
 @dataclass
 class SearchResult:
-    """Standardized result object."""
     value: Any
     confidence: float
     sheet_name: str
@@ -58,30 +62,22 @@ class SearchResult:
     header_path: List[str]
     context_text: str
     value_type: str
+    table_bounds: TableBounds
 
     def __repr__(self):
         path = " > ".join(self.header_path)
-        return (f"<Result value={self.value} | confidence={self.confidence:.2f} | "
-                f"loc={self.sheet_name}!{self.row+1}:{self.col+1} | path='{path}'>")
-
-class ValueType(Enum):
-    NUMBER = "number"
-    TEXT = "text"
-    PERCENTAGE = "percentage"
-    DATE = "date"
-    ANY = "any"
+        return (f"<Result value={self.value} | conf={self.confidence:.2f} | "
+                f"path='{path}' | table={self.table_bounds.sheet_name}>")
 
 # ==========================================
-# 2. Semantic Matching Backends
+# 2. Semantic Matching (Unchanged)
 # ==========================================
 
 class SemanticMatcher:
-    """Base interface for similarity."""
     def calculate_similarity(self, query: str, target: str) -> float:
         raise NotImplementedError
 
 class BasicSemanticMatcher(SemanticMatcher):
-    """Fallback matcher using token overlap."""
     def normalize(self, text: str) -> set:
         text = str(text).lower().strip()
         text = re.sub(r'[^\w\s]', '', text)
@@ -91,17 +87,14 @@ class BasicSemanticMatcher(SemanticMatcher):
         q_tok = self.normalize(query)
         t_tok = self.normalize(target)
         if not q_tok or not t_tok: return 0.0
-        
         intersection = len(q_tok & t_tok)
         union = len(q_tok | t_tok)
-        
         score = intersection / union if union > 0 else 0.0
         if query.lower() in target.lower():
             score = max(score, 0.9)
         return score
 
 class OpenAISemanticMatcher(SemanticMatcher):
-    """Enterprise matcher using OpenAI Embeddings."""
     def __init__(self, api_key: str, model: str):
         try:
             from openai import OpenAI
@@ -116,11 +109,7 @@ class OpenAISemanticMatcher(SemanticMatcher):
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         if not texts: return []
         clean_texts = [t.replace("\n", " ")[:8000] for t in texts]
-        
-        response = self.client.embeddings.create(
-            input=clean_texts,
-            model=self.model
-        )
+        response = self.client.embeddings.create(input=clean_texts, model=self.model)
         return [data.embedding for data in response.data]
 
     def cosine_similarity(self, vec_a: List[float], vec_b: List[float]) -> float:
@@ -132,11 +121,156 @@ class OpenAISemanticMatcher(SemanticMatcher):
         return np.dot(a, b) / (norm_a * norm_b)
 
 # ==========================================
-# 3. Structure & Data Handling
+# 3. Advanced Structure Detection
 # ==========================================
 
-class MergedCellHandler:
-    """Handles Excel merged cells and extracts style info."""
+class AdvancedStructureDetector:
+    """Multi-pass header detection with location context."""
+    
+    def __init__(self, config: QueryEngineConfig):
+        self.config = config
+    
+    def analyze_sheet(self, df: pd.DataFrame, bold_grid: List[List[bool]]) -> List[TableBounds]:
+        """Two-pass analysis: headers first, then refine with row patterns."""
+        tables = []
+        i = 0
+        
+        while i < len(df):
+            # Pass 1: Find header blocks
+            header_info = self._detect_header_block(df, bold_grid, i)
+            if not header_info:
+                i += 1
+                continue
+            
+            header_start, header_rows = header_info
+            
+            # Determine table bounds
+            left_col, right_col = self._find_horizontal_span(df, header_start, header_rows)
+            
+            # Pass 2: Analyze data rows for row headers
+            data_start = header_start + header_rows
+            data_end = self._find_data_end(df, data_start)
+            
+            tables.append(TableBounds(
+                sheet_name="",
+                top_row=header_start,
+                bottom_row=data_end,
+                left_col=left_col,
+                right_col=right_col,
+                header_rows=header_rows
+            ))
+            i = data_end
+        
+        return tables
+    
+    def _detect_header_block(self, df: pd.DataFrame, bold_grid: List[List[bool]], start_row: int) -> Optional[Tuple[int, int]]:
+        """Find contiguous header rows using content + style."""
+        header_start = start_row
+        header_end = start_row
+        
+        for r in range(start_row, min(start_row + 5, len(df))):
+            row_vals = df.iloc[r]
+            if self._is_header_row(row_vals, bold_grid[r]):
+                header_end = r + 1
+            else:
+                break
+        
+        return (header_start, header_end - header_start) if header_end > header_start else None
+    
+    def _find_horizontal_span(self, df: pd.DataFrame, header_start: int, header_rows: int) -> Tuple[int, int]:
+        """Find leftmost/rightmost columns with header content."""
+        header_block = df.iloc[header_start:header_start + header_rows]
+        non_empty_cols = []
+        
+        for c in range(len(df.columns)):
+            if header_block.iloc[:, c].notna().any():
+                non_empty_cols.append(c)
+        
+        return (min(non_empty_cols) if non_empty_cols else 0, 
+                max(non_empty_cols) if non_empty_cols else len(df.columns) - 1)
+    
+    def _find_data_end(self, df: pd.DataFrame, start_row: int) -> int:
+        """Find end of data (2 consecutive empty rows)."""
+        empty_count = 0
+        for r in range(start_row, len(df)):
+            if df.iloc[r].isna().all():
+                empty_count += 1
+                if empty_count >= 2:
+                    return r
+            else:
+                empty_count = 0
+        return len(df)
+    
+    def _is_header_row(self, row: pd.Series, bold_row: List[bool]) -> bool:
+        clean_row = row.dropna()
+        if len(clean_row) == 0: return False
+        
+        text_count = sum(isinstance(x, str) for x in clean_row)
+        text_ratio = text_count / len(clean_row)
+        
+        bold_count = sum(1 for idx, is_bold in enumerate(bold_row) 
+                        if is_bold and pd.notna(row.iloc[idx]))
+        bold_ratio = bold_count / len(clean_row)
+        
+        score = text_ratio + (bold_ratio * self.config.style_weight_boost)
+        return score >= self.config.header_text_ratio_threshold
+    
+    def classify_data_row(self, row: pd.Series, bold_row: List[bool], 
+                         table_bounds: TableBounds) -> List[CellRole]:
+        """Classify each cell in a data row: row_header vs value."""
+        roles = []
+        non_null_count = 0
+        
+        # Count numeric vs string ratio
+        numeric_count = 0
+        string_positions = []
+        
+        for idx, val in enumerate(row):
+            if pd.notna(val):
+                non_null_count += 1
+                if self._is_numeric_like(val):
+                    numeric_count += 1
+                else:
+                    string_positions.append(idx)
+        
+        # If mostly numeric with few strings -> strings are row headers
+        string_ratio = len(string_positions) / non_null_count if non_null_count > 0 else 0
+        is_numeric_row = (numeric_count / non_null_count > (1 - self.config.numeric_row_string_threshold))
+        
+        for col_idx, val in enumerate(row):
+            is_bold = bold_row[col_idx] if col_idx < len(bold_row) else False
+            
+            # Within table bounds?
+            in_bounds = (table_bounds.left_col <= col_idx <= table_bounds.right_col)
+            
+            if pd.isna(val):
+                role = 'empty'
+            elif not in_bounds:
+                role = 'empty'
+            elif is_numeric_row and col_idx in string_positions:
+                role = 'row_header'  # String in numeric row = row header
+            elif self._is_numeric_like(val):
+                role = 'value'
+            else:
+                role = 'row_header'  # Default strings to row headers
+        
+            roles.append(CellRole(col_idx, col_idx, val, role, is_bold, None))
+        
+        return roles
+
+    def _is_numeric_like(self, val: Any) -> bool:
+        """Check if value looks numeric."""
+        if pd.isna(val): return False
+        if isinstance(val, (int, float)): return True
+        if isinstance(val, str):
+            return bool(re.match(r'^-?\d+(?:\.\d+)?(?:[kmb]?)?:?$', str(val).replace(',', '').strip()))
+        return False
+
+# ==========================================
+# 4. Enhanced Merged Cell Handler
+# ==========================================
+
+class EnhancedMergedCellHandler:
     def __init__(self, file_path: str):
         self.wb = load_workbook(file_path, data_only=True)
         self.merged_map = {}
@@ -169,85 +303,20 @@ class MergedCellHandler:
 
         return pd.DataFrame(data_rows), bold_grid
 
-class StructureDetector:
-    """Heuristic engine to find headers and data tables."""
-    def __init__(self, config: QueryEngineConfig):
-        self.config = config
-
-    def detect_tables(self, df: pd.DataFrame, bold_grid: List[List[bool]]) -> List[Dict]:
-        tables = []
-        i = 0
-        max_rows = len(df)
-
-        while i < max_rows:
-            if df.iloc[i].isna().all():
-                i += 1
-                continue
-
-            header_start = i
-            header_end = i
-            
-            for r in range(i, min(i + 5, max_rows)):
-                row_vals = df.iloc[r]
-                if self._is_header_row(row_vals, bold_grid[r]):
-                    header_end = r + 1
-                else:
-                    break
-            
-            if header_end == header_start:
-                i += 1
-                continue
-            
-            data_start = header_end
-            data_end = data_start
-            empty_counter = 0
-            
-            for r in range(data_start, max_rows):
-                if df.iloc[r].isna().all():
-                    empty_counter += 1
-                    if empty_counter >= 2:
-                        break
-                else:
-                    empty_counter = 0
-                    data_end = r + 1
-            
-            if data_end > data_start:
-                tables.append({
-                    'header_range': (header_start, header_end),
-                    'data_range': (data_start, data_end)
-                })
-                i = data_end
-            else:
-                i += 1
-        
-        return tables
-
-    def _is_header_row(self, row: pd.Series, bold_row: List[bool]) -> bool:
-        clean_row = row.dropna()
-        if len(clean_row) == 0: return False
-        
-        text_count = sum(isinstance(x, str) for x in clean_row)
-        text_ratio = text_count / len(clean_row)
-        
-        bold_count = sum(1 for idx, is_bold in enumerate(bold_row) if is_bold and pd.notna(row.iloc[idx]))
-        bold_ratio = bold_count / len(clean_row)
-        
-        score = text_ratio + (bold_ratio * self.config.style_weight_boost)
-        return score >= self.config.header_text_ratio_threshold
-
 # ==========================================
-# 4. Main Engine
+# 5. Main Engine V5
 # ==========================================
 
-class FinancialExcelEngine:
+class FinancialExcelEngineV5:
     def __init__(self, file_path: str, config: QueryEngineConfig):
         self.file_path = file_path
         self.config = config
-        self.records = []
+        self.records: List[Dict] = []
+        self.tables: List[TableBounds] = []
         self.vector_index = {}
         
-        self.merge_handler = MergedCellHandler(file_path)
-        self.detector = StructureDetector(config)
+        self.handler = EnhancedMergedCellHandler(file_path)
+        self.detector = AdvancedStructureDetector(config)
         
         if config.semantic_backend == 'openai':
             if not config.openai_api_key:
@@ -256,94 +325,115 @@ class FinancialExcelEngine:
         else:
             self.matcher = BasicSemanticMatcher()
 
-        print("Parsing file structure...")
-        self._ingest_file()
+        print("🔍 Advanced structure analysis...")
+        self._ingest_file_enhanced()
         
         if config.semantic_backend == 'openai':
-            print("Generating embeddings...")
+            print("📊 Building vector index...")
             self._build_embeddings()
-        print("Engine Ready.")
+        print(f"✅ Engine ready: {len(self.records)} values, {len(self.tables)} tables")
 
-    def _ingest_file(self):
+    def _ingest_file_enhanced(self):
+        """Enhanced ingestion with precise cell classification."""
         wb = load_workbook(self.file_path, read_only=True)
+        table_id = 0
         
         for sheet_name in wb.sheetnames:
-            df, bold_grid = self.merge_handler.get_sheet_data_and_styles(sheet_name)
-            tables = self.detector.detect_tables(df, bold_grid)
+            df, bold_grid = self.handler.get_sheet_data_and_styles(sheet_name)
             
-            for tbl in tables:
-                h_start, h_end = tbl['header_range']
-                d_start, d_end = tbl['data_range']
+            # Detect tables with bounds
+            raw_tables = self.detector.analyze_sheet(df, bold_grid)
+            
+            for raw_table in raw_tables:
+                table = TableBounds(
+                    sheet_name=sheet_name,
+                    top_row=raw_table.top_row,
+                    bottom_row=raw_table.bottom_row,
+                    left_col=raw_table.left_col,
+                    right_col=raw_table.right_col,
+                    header_rows=raw_table.header_rows
+                )
+                self.tables.append(table)
                 
-                header_block = df.iloc[h_start:h_end].ffill(axis=1)
+                # Process header block for column paths
+                header_block = df.iloc[table.top_row:table.top_row + table.header_rows]
+                header_block = header_block.ffill(axis=1)
+                
                 col_paths = []
-                for c in range(len(df.columns)):
+                for c in range(table.left_col, table.right_col + 1):
                     raw_path = header_block.iloc[:, c].tolist()
-                    clean_path = [str(p).strip() for p in raw_path if pd.notna(p) and str(p).strip() != ""]
+                    clean_path = [str(p).strip() for p in raw_path 
+                                if pd.notna(p) and str(p).strip()]
                     col_paths.append(clean_path)
                 
-                for r_idx in range(d_start, d_end):
+                # Process data rows with cell classification
+                for r_idx in range(table.top_row + table.header_rows, table.bottom_row):
                     row_data = df.iloc[r_idx]
-                    row_label_idx = row_data.first_valid_index()
-                    if row_label_idx is None: continue
+                    row_roles = self.detector.classify_data_row(
+                        row_data, bold_grid[r_idx], table
+                    )
                     
-                    row_label = str(row_data[row_label_idx]).strip()
+                    # Find row header (first non-value cell)
+                    row_header_candidates = [role for role in row_roles if role.role == 'row_header']
+                    if not row_header_candidates:
+                        continue
                     
-                    for c_idx, val in enumerate(row_data):
-                        if pd.isna(val) or c_idx == row_label_idx: continue
-                        if str(val).strip() == "": continue
+                    row_label = str(row_header_candidates[0].value).strip()
+                    
+                    # Only process VALUE cells
+                    for cell_role in row_roles:
+                        if (cell_role.role != 'value' or 
+                            cell_role.col < table.left_col or 
+                            cell_role.col > table.right_col):
+                            continue
                         
-                        full_path = [row_label] + col_paths[c_idx]
+                        col_path = col_paths[cell_role.col - table.left_col]
+                        full_path = [row_label] + col_path
                         
                         record = {
                             'sheet': sheet_name,
                             'row': r_idx,
-                            'col': c_idx,
-                            'value': val,
+                            'col': cell_role.col,
+                            'value': cell_role.value,
                             'header_path': full_path,
                             'searchable_text': " ".join(full_path),
-                            'type': self._get_type(val)
+                            'type': self._get_type(cell_role.value),
+                            'table_id': table_id
                         }
                         self.records.append(record)
+                
+                table_id += 1
 
     def _build_embeddings(self, batch_size=50):
         unique_texts = list(set(r['searchable_text'] for r in self.records))
         for i in range(0, len(unique_texts), batch_size):
             batch = unique_texts[i:i+batch_size]
-            try:
-                vectors = self.matcher.embed_batch(batch)
-                for text, vec in zip(batch, vectors):
-                    self.vector_index[text] = vec
-            except Exception as e:
-                print(f"Warning: Batch embedding failed: {e}")
+            vectors = self.matcher.embed_batch(batch)
+            for text, vec in zip(batch, vectors):
+                self.vector_index[text] = vec
 
     def _get_type(self, val) -> str:
         if isinstance(val, (int, float)): return "number"
         if isinstance(val, str): return "text"
         return "unknown"
-    
+
     def _extract_critical_tokens(self, query: str) -> Set[str]:
-        """Identify tokens that MUST exist (Years, Quarters, specific Codes)."""
         tokens = set()
         parts = query.split()
         for p in parts:
             clean_p = p.strip().lower()
-            # Regex for Years (19XX or 20XX)
             if re.match(r'^(19|20)\d{2}$', clean_p):
                 tokens.add(clean_p)
-            # Regex for Quarters (Q1-Q4)
             elif re.match(r'^q[1-4]$', clean_p):
                 tokens.add(clean_p)
-            # Structural Modifiers
             elif clean_p in ['total', 'net', 'gross', 'operating', 'ebitda']:
                 tokens.add(clean_p)
         return tokens
 
     def query(self, question: str, top_k=5) -> List[SearchResult]:
-        """Precision Query: Strict Constraint Enforcement + Hybrid Scoring."""
         query_tokens = set(question.lower().split())
         critical_tokens = self._extract_critical_tokens(question)
-        prefer_number = any(x in question.lower() for x in ['how much', 'total', 'cost', 'revenue', 'profit', 'sum'])
+        prefer_number = any(x in question.lower() for x in ['how much', 'total', 'cost', 'revenue', 'profit'])
         
         scored_results = []
         q_vec = None
@@ -354,14 +444,14 @@ class FinancialExcelEngine:
         for r in self.records:
             target_text = r['searchable_text'].lower()
             
-            # --- A. Constraint Check ---
+            # Constraint penalty
             constraint_penalty = 1.0
             if critical_tokens:
-                missing_critical = [t for t in critical_tokens if t not in target_text]
-                if missing_critical:
-                    constraint_penalty = 0.1 # Severe penalty for missing year/type
+                missing = [t for t in critical_tokens if t not in target_text]
+                if missing:
+                    constraint_penalty = 0.1
             
-            # --- B. Semantic Score ---
+            # Semantic score
             semantic_score = 0.0
             if self.config.semantic_backend == 'openai' and q_vec:
                 target_vec = self.vector_index.get(r['searchable_text'])
@@ -370,35 +460,31 @@ class FinancialExcelEngine:
             else:
                 semantic_score = self.matcher.calculate_similarity(question, r['searchable_text'])
             
-            # --- C. Keyword Overlap Score ---
+            # Keyword coverage
             target_tokens = set(target_text.split())
-            keyword_coverage = 0.0
-            if query_tokens:
-                intersection = query_tokens.intersection(target_tokens)
-                keyword_coverage = len(intersection) / len(query_tokens)
+            keyword_coverage = len(query_tokens.intersection(target_tokens)) / len(query_tokens) if query_tokens else 0.0
             
-            # --- D. Weighted Blend ---
-            # 65% Semantic (Context) + 35% Keywords (Precision)
+            # Weighted score
             base_score = (semantic_score * 0.65) + (keyword_coverage * 0.35)
-            
-            # Perfect substring boost
             if question.lower() in target_text:
                 base_score = max(base_score, 0.98)
                 
             final_score = base_score * constraint_penalty
-            
-            # --- E. Type Validation ---
             if prefer_number and r['type'] != 'number':
                 final_score *= 0.85
 
             if final_score >= self.config.min_confidence:
-                scored_results.append((final_score, r))
-        
+                # Find table bounds
+                table = next((t for t in self.tables if t.sheet_name == r['sheet']), None)
+                scored_results.append((final_score, {
+                    **r, 'table_bounds': table
+                }))
+
         scored_results.sort(key=lambda x: x[0], reverse=True)
         
         final_output = []
-        for score, r in scored_results:
-            res = SearchResult(
+        for score, r in scored_results[:top_k]:
+            final_output.append(SearchResult(
                 value=r['value'],
                 confidence=score,
                 sheet_name=r['sheet'],
@@ -406,56 +492,33 @@ class FinancialExcelEngine:
                 col=r['col'],
                 header_path=r['header_path'],
                 context_text=r['searchable_text'],
-                value_type=r['type']
-            )
-            final_output.append(res)
-            if len(final_output) >= top_k: break
-            
+                value_type=r['type'],
+                table_bounds=r['table_bounds']
+            ))
         return final_output
 
 # ==========================================
-# 5. Example Usage
+# Example Usage
 # ==========================================
 if __name__ == "__main__":
-    # Demo Setup
     dummy_file = "financial_demo.xlsx"
     if not os.path.exists(dummy_file):
-        print("Creating dummy financial file...")
+        print("Creating enhanced demo file...")
         df = pd.DataFrame({
-            'Metric': ['Revenue', 'Net Income', 'Gross Profit'],
-            '2022': [100, 20, 40],
-            '2023': [120, 25, 50]
+            'Category': ['Revenue', 'COGS', 'Gross Profit', 'Header'],
+            '2023 Q1': [100, 40, 60, ''],
+            '2023 Q2': [110, 42, 68, ''],
+            '2024 Q1': [120, 45, 75, '']
         })
         with pd.ExcelWriter(dummy_file, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='P&L', index=False)
 
-    # Config
-    api_key = os.getenv("OPENAI_API_KEY", "sk-placeholder-key")
     config = QueryEngineConfig(
-        semantic_backend='openai', 
-        openai_api_key=api_key,
-        min_confidence=0.6  # High confidence for precision
+        semantic_backend='basic',  # Use 'openai' with real key
+        min_confidence=0.4
     )
 
-    try:
-        print("\n--- Initializing Precision Engine ---")
-        engine = FinancialExcelEngine(dummy_file, config)
-        
-        # Test Queries
-        queries = [
-            "Revenue 2023",      # Critical token: 2023
-            "Net Income 2022",   # Critical token: Net, 2022
-            "Total Assets"       # Semantic match (if present)
-        ]
-        
-        for q in queries:
-            print(f"\nQuery: '{q}'")
-            results = engine.query(q)
-            if not results:
-                print("  No results found (Strict constraints applied).")
-            for r in results:
-                print(f"  [Score: {r.confidence:.2f}] {r.value} (Path: {' > '.join(r.header_path)})")
-                
-    except Exception as e:
-        print(f"\nError: {e}")
-        print("Ensure you have set OPENAI_API_KEY environment variable.")
+    engine = FinancialExcelEngineV5(dummy_file, config)
+    
+    for q in ["Revenue 2023", "Gross Profit Q1"]:
+        print(f"\n🔍 '{q}' -> {engine.query(q)}")
