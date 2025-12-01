@@ -144,6 +144,39 @@ class AdvancedStructureDetector:
             tables.append(precise_table)
             i = precise_table.bottom_row
         return tables
+
+    def build_hierarchical_headers(self, df: pd.DataFrame, table: TableBounds) -> List[List[str]]:
+        # Extract header block rows controlling for max index
+        header_start = table.top_row
+        header_end = min(table.top_row + table.header_rows, len(df))
+        
+        header_block = df.iloc[header_start:header_end, table.left_col:table.right_col+1].copy()
+    
+        # Forward fill horizontally to handle merged headers spanning multiple columns
+        header_block.ffill(axis=1, inplace=True)
+        
+        # Optional backward fill to cover edge cases of right-aligned headers
+        header_block.bfill(axis=1, inplace=True)
+        
+        col_paths = []
+        num_header_rows = header_end - header_start
+        num_cols = table.right_col - table.left_col + 1
+        
+        for col_idx in range(num_cols):
+            path = []
+    
+            # Traverse vertically through header rows for this column
+            for row_idx in range(num_header_rows):
+                cell_value = header_block.iat[row_idx, col_idx]
+                if pd.notna(cell_value):
+                    val_str = str(cell_value).strip()
+                    if val_str and val_str.lower() != 'nan':
+                        path.append(val_str)
+    
+            col_paths.append(path)
+        
+        return col_paths
+
     
     def _detect_extended_header_block(self, df: pd.DataFrame, bold_grid: List[List[bool]], start_row: int) -> Optional[Tuple[int, int]]:
         header_start = start_row
