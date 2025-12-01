@@ -1,13 +1,4 @@
-"""
-Financial Excel Query Engine V7 (Complete Enterprise Grade System)
------------------------------------------------------------------
-Features:
-- Connected component-based table detection with density heuristics
-- Multi-level header reconstruction with merged cell handling and bold style detection
-- Precise spatial boundaries for tables and exclusion of unrelated footnotes/annotations
-- Semantic indexing with hybrid keyword + embedding search (basic or OpenAI supported)
-- Zero hallucination: only exact cell values returned with provenance
-"""
+
 
 import os
 import re
@@ -17,7 +8,6 @@ import pandas as pd
 from typing import List, Dict, Tuple, Any, Optional, Literal, Set
 from dataclasses import dataclass
 from openpyxl import load_workbook
-from openpyxl.styles import Font
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
@@ -42,7 +32,7 @@ class CellClassification:
     row: int
     col: int
     value: Any
-    role: str  # 'table_header', 'row_header', 'data_value', 'annotation', 'empty', 'outside_table'
+    role: str
     confidence: float
     is_bold: bool
 
@@ -118,10 +108,6 @@ class OpenAISemanticMatcher(SemanticMatcher):
             return 0.0
         return float(np.dot(a, b) / (norm_a * norm_b))
 
-    def calculate_similarity(self, query: str, target: str) -> float:
-        # For compatibility fallback, can use basic matcher
-        return BasicSemanticMatcher().calculate_similarity(query, target)
-
 # ==========================================
 # 3. Excel Loader With Bold Grid
 # ==========================================
@@ -137,11 +123,10 @@ class ExcelLoader:
         data = []
         bold_grid = []
 
-        for r_idx, row in enumerate(sheet.iter_rows(), start=1):
+        for row in sheet.iter_rows():
             row_vals = []
             row_bolds = []
-            for c_idx, cell in enumerate(row, start=1):
-                lookup = cell.coordinate
+            for cell in row:
                 val = cell.value
                 row_vals.append(val)
                 is_bold = bool(cell.font and cell.font.bold)
@@ -233,23 +218,21 @@ class TableDetector:
         non_na = region.notna().sum().sum()
         density = non_na / cells_count if cells_count else 0.0
         
-        # Detect header rows
         header_rows = self._detect_header_rows(df, bold_grid, min_r, min_c, max_c)
-        # Detect row header col (mostly string col)
         row_header_col = self._detect_row_header_col(df, min_r+header_rows, max_r, min_c, max_c)
         
-        return TableRegion(df.columns.name if df.columns.name else "", min_r, max_r, min_c, max_c, header_rows, row_header_col, density)
+        return TableRegion("", min_r, max_r, min_c, max_c, header_rows, row_header_col, density)
 
     def _detect_header_rows(self, df: pd.DataFrame, bold_grid: List[List[bool]], top: int, left: int, right: int) -> int:
         max_header_rows = 5
         best_rows = 1
         for rows_count in range(1, max_header_rows + 1):
-            header_block = df.iloc[top:top+rows_count, left:right+1]
-            total_cells = header_block.size
             text_cells = 0
             bold_cells = 0
-            for r in range(top, top+rows_count):
-                for c in range(left, right+1):
+            total_cells = 0
+            for r in range(top, min(top+rows_count, len(df))):
+                for c in range(left, min(right+1, len(df.columns))):
+                    total_cells += 1
                     val = df.iat[r, c]
                     if isinstance(val, str):
                         text_cells +=1
@@ -265,7 +248,7 @@ class TableDetector:
     def _detect_row_header_col(self, df: pd.DataFrame, data_top: int, data_bottom: int, left: int, right: int) -> int:
         best_col = left
         best_text_ratio = 0
-        for c in range(left, right +1):
+        for c in range(left, min(right+1, len(df.columns))):
             col_vals = df.iloc[data_top:data_bottom+1, c]
             non_na = col_vals.notna().sum()
             text_count = col_vals.apply(lambda x: isinstance(x, str)).sum()
@@ -276,46 +259,74 @@ class TableDetector:
         return best_col
 
 # ==========================================
-# 4. Header Reconstruction
+# 5. Header Reconstruction (FIXED ffill)
 # ==========================================
 
 class HeaderReconstructor:
     def reconstruct_column_headers(self, df: pd.DataFrame, table: TableRegion) -> List[List[str]]:
         header_top = table.top_row
         header_bottom = min(table.top_row + table.header_rows, len(df))
-        col_indices = range(table.left_col, table.right_col + 1)
-
-        header_block = df.iloc[header_top:header_bottom, table.left_col:table.right_col+1].copy()
-
-        header_block.ffill(axis=1, inplace=True)
-        header_block.bfill(axis=1, inplace=True)
-
+        
+        # Extract header block as numpy array for manual filling
+        header_data = []
+        for r in range(header_top, header_bottom):
+            row_data = []
+            for c in range(table.left_col, table.right_col+1):
+                if r < len(df) and c < len(df.columns):
+                    row_data.append(df.iat[r, c])
+                else:
+                    row_data.append(None)
+            header_data.append(row_data)
+        
+        # Manual forward fill horizontally (left to right)
+        for r_idx in range(len(header_data)):
+            last_val = None
+            for c_idx in range(len(header_data[r_idx])):
+                if pd.notna(header_data[r_idx][c_idx]):
+                    last_val = header_data[r_idx][c_idx]
+                elif last_val is not None:
+                    header_data[r_idx][c_idx] = last_val
+        
+        # Manual backward fill horizontally (right to left)
+        for r_idx in range(len(header_data)):
+            next_val = None
+            for c_idx in range(len(header_data[r_idx])-1, -1, -1):
+                if pd.notna(header_data[r_idx][c_idx]):
+                    next_val = header_data[r_idx][c_idx]
+                elif next_val is not None:
+                    header_data[r_idx][c_idx] = next_val
+        
+        # Build column paths
         col_paths = []
-        for col_idx in range(len(col_indices)):
+        num_cols = table.right_col - table.left_col + 1
+        for col_idx in range(num_cols):
             path = []
-            for row_idx in range(header_bottom - header_top):
-                val = header_block.iat[row_idx, col_idx]
-                if pd.notna(val) and str(val).strip():
-                    path.append(str(val).strip())
+            for row_idx in range(len(header_data)):
+                if col_idx < len(header_data[row_idx]):
+                    val = header_data[row_idx][col_idx]
+                    if pd.notna(val) and str(val).strip():
+                        path.append(str(val).strip())
             col_paths.append(path)
         return col_paths
 
 # ==========================================
-# 5. Cell Classifier
+# 6. Cell Classifier
 # ==========================================
 
 class CellClassifier:
     def classify(self, df: pd.DataFrame, table: TableRegion, bold_grid: List[List[bool]]) -> List[CellClassification]:
         classifications = []
         for r in range(table.top_row, table.bottom_row+1):
-            for c in range(table.left_col, table.right_col +1):
-                val = df.iat[r,c]
+            for c in range(table.left_col, table.right_col+1):
+                if r >= len(df) or c >= len(df.columns):
+                    continue
+                val = df.iat[r, c]
                 is_bold = r < len(bold_grid) and c < len(bold_grid[r]) and bold_grid[r][c]
                 role = self._classify_cell_role(r, c, val, r < table.top_row + table.header_rows, c == table.row_header_col, is_bold)
-                classifications.append(CellClassification(r,c,val,role,1.0 if role != 'empty' else 0.0,is_bold))
+                classifications.append(CellClassification(r, c, val, role, 1.0 if role != 'empty' else 0.0, is_bold))
         return classifications
 
-    def _classify_cell_role(self, row:int, col:int, val:Any, in_header:bool, is_row_header_col:bool, is_bold:bool) -> str:
+    def _classify_cell_role(self, row: int, col: int, val: Any, in_header: bool, is_row_header_col: bool, is_bold: bool) -> str:
         if pd.isna(val):
             return 'empty'
         if in_header:
@@ -328,25 +339,24 @@ class CellClassifier:
             return 'annotation'
         return 'data_value' if is_bold else 'annotation'
 
-    def _is_numeric_like(self,val:Any) -> bool:
+    def _is_numeric_like(self, val: Any) -> bool:
         if pd.isna(val):
             return False
-        if isinstance(val,(int,float)):
+        if isinstance(val, (int, float)):
             return True
-        if isinstance(val,str):
-            c = val.replace(',','').strip()
-            return bool(re.match(r'^-?\d+(\.\d+)?$',c))
+        if isinstance(val, str):
+            c = str(val).replace(',', '').replace('$', '').replace('%', '').replace('(', '').replace(')', '').strip()
+            return bool(re.match(r'^-?\d+(\.\d+)?$', c))
         return False
 
 # ==========================================
-# 6. Semantic Indexer and Query Engine
+# 7. Semantic Indexer
 # ==========================================
 
 class EnterpriseDataIndexer:
     def __init__(self, config: QueryEngineConfig):
         self.config = config
         self.records = []
-        self.matcher_cache = {}
 
     def build_index(self, df: pd.DataFrame, bold_grid: List[List[bool]], tables: List[TableRegion]):
         reconstructor = HeaderReconstructor()
@@ -354,19 +364,23 @@ class EnterpriseDataIndexer:
         for table in tables:
             cols_headers = reconstructor.reconstruct_column_headers(df, table)
             classifications = classifier.classify(df, table, bold_grid)
-            # Map (row,col) to classification
-            cls_map = {(c.row,c.col): c.role for c in classifications}
+            
             for c in classifications:
                 if c.role != 'data_value':
                     continue
                 r, col = c.row, c.col
-                row_header_vals = [val.value for val in classifications if val.role == 'row_header' and val.row == r]
+                row_header_vals = [cell.value for cell in classifications if cell.role == 'row_header' and cell.row == r]
                 row_header = str(row_header_vals[0]) if row_header_vals else ""
-                col_idx = col - table.left_col - 1 if table.row_header_col == table.left_col else col - table.left_col
+                
+                col_idx = col - table.left_col
+                if table.row_header_col == table.left_col:
+                    col_idx -= 1
+                
                 if 0 <= col_idx < len(cols_headers):
                     col_header_path = cols_headers[col_idx]
                 else:
                     col_header_path = []
+                
                 full_path = [row_header] + col_header_path
                 search_text = " ".join(full_path)
                 rec = {
@@ -381,21 +395,30 @@ class EnterpriseDataIndexer:
                 }
                 self.records.append(rec)
 
+# ==========================================
+# 8. Main Engine
+# ==========================================
+
 class FinancialExcelEngineV7:
-    def __init__(self, filepath:str, config:QueryEngineConfig=QueryEngineConfig()):
+    def __init__(self, filepath: str, config: QueryEngineConfig = QueryEngineConfig()):
         self.filepath = filepath
         self.config = config
         self.loader = ExcelLoader(filepath)
         self.table_detector = TableDetector(config)
         self.indexer = EnterpriseDataIndexer(config)
+        
         if config.semantic_backend == 'openai':
+            if not config.openai_api_key:
+                config.openai_api_key = os.getenv("OPENAI_API_KEY")
             if not config.openai_api_key:
                 raise ValueError("OPENAI_API_KEY required")
             self.matcher = OpenAISemanticMatcher(config.openai_api_key, config.openai_model)
         else:
             self.matcher = BasicSemanticMatcher()
+        
+        print("🔍 Loading and indexing tables...")
         self._load_and_index()
-        print(f"Engine ready with {len(self.indexer.records)} indexed values.")
+        print(f"✅ Engine ready with {len(self.indexer.records)} indexed values")
 
     def _load_and_index(self):
         wb = load_workbook(self.filepath, data_only=True)
@@ -406,15 +429,17 @@ class FinancialExcelEngineV7:
                 t.sheet_name = sheetname
             self.indexer.build_index(df, bold_grid, tables)
 
-    def query(self, question:str, top_k:int=5) -> List[SearchResult]:
+    def query(self, question: str, top_k: int = 5) -> List[SearchResult]:
         q_tokens = set(question.lower().split())
         scored = []
         q_vec = None
+        
         if self.config.semantic_backend == 'openai':
             try:
                 q_vec = self.matcher.embed_batch([question])[0]
             except:
                 q_vec = None
+        
         for rec in self.indexer.records:
             sem_score = 0.0
             if self.config.semantic_backend == 'openai' and q_vec:
@@ -430,10 +455,13 @@ class FinancialExcelEngineV7:
                     sem_score = self.matcher.cosine_similarity(q_vec, t_vec)
             else:
                 sem_score = self.matcher.calculate_similarity(question, rec['search_text'])
+            
             keyword_overlap = len(q_tokens & set(rec['search_text'].lower().split())) / len(q_tokens) if q_tokens else 0
             score = 0.7 * sem_score + 0.3 * keyword_overlap
+            
             if score > self.config.min_confidence:
                 scored.append((score, rec))
+        
         scored.sort(key=lambda x: x[0], reverse=True)
         results = []
         for s, rec in scored[:top_k]:
@@ -450,12 +478,14 @@ class FinancialExcelEngineV7:
             ))
         return results
 
-# ============== Example Usage ==============
+# ==========================================
+# 9. Example Usage
+# ==========================================
 
-if __name__=="__main__":
+if __name__ == "__main__":
     demo_file = "enterprise_demo.xlsx"
     if not os.path.exists(demo_file):
-        print("Creating demo Excel...")
+        print("Creating demo Excel file...")
         df1 = pd.DataFrame({
             'Metric': ['Revenue', 'EBITDA', 'Net Income'],
             '2023 Q1': [1000, 250, 180],
@@ -466,14 +496,16 @@ if __name__=="__main__":
             'Balance': [500, 300],
             'Note': ['See note 1', 'Footnote 2']
         })
-        with pd.ExcelWriter(demo_file) as writer:
+        with pd.ExcelWriter(demo_file, engine='openpyxl') as writer:
             df1.to_excel(writer, sheet_name='Financials', index=False)
             df2.to_excel(writer, sheet_name='BalanceSheet', index=False)
+    
     config = QueryEngineConfig(semantic_backend='basic', min_table_density=0.3)
     engine = FinancialExcelEngineV7(demo_file, config)
+    
     queries = ["Revenue 2023", "Net Income Q2", "Cash balance"]
     for q in queries:
-        print(f"\nQuery: {q}")
+        print(f"\n🔍 Query: {q}")
         results = engine.query(q)
         for r in results:
-            print(f"Value: {r.value}, Path: {r.full_path}, Confidence: {r.confidence:.2f}")
+            print(f"  💰 Value: {r.value} | Path: {r.full_path} | Confidence: {r.confidence:.2f}")
