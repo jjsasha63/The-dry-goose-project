@@ -105,6 +105,23 @@ class OpenAISemanticMatcher:
         response = self.client.embeddings.create(input=clean_texts, model=self.model_name)
         return [data.embedding for data in response.data]
 
+    def calculate_similarity(self, query: str, target: str) -> float:
+        """
+        Approximates semantic similarity between query and target by
+        embedding both texts and computing cosine similarity.
+        """
+        try:
+            q_vec = self.embed_batch([query])[0]
+            if target in self.cache:
+                t_vec = self.cache[target]
+            else:
+                t_vec = self.embed_batch([target])[0]
+                self.cache[target] = t_vec
+            return self.cosine_similarity(q_vec, t_vec)
+        except Exception:
+            # Fallback to basic similarity if embedding fails
+            return BasicSemanticMatcher().calculate_similarity(query, target)
+    
     def cosine_similarity(self, vec_a: List[float], vec_b: List[float]) -> float:
         """Compute cosine similarity between two vectors."""
         a = np.array(vec_a)
