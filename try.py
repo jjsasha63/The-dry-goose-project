@@ -722,17 +722,36 @@ class FinancialExcelEngine:
     def _process_table(self, df: pd.DataFrame, style_grid: List[List[Dict]], 
                       sheet_name: str, table: Dict, table_idx: int, 
                       boundaries: Dict[str, int], all_tables: List[Dict]):
-        """Process table with universal note filtering."""
+        """Process table with note filtering in BOTH headers and values."""
         h_start, h_end = table['header_range']
         d_start, d_end = table['data_range']
         v_header_cols = table['vertical_header_cols']
         
         header_block = df.iloc[h_start:h_end]
-        col_paths = self._build_column_paths(header_block)
+        
+        # 🔥 Pass additional context for note filtering
+        col_paths = self._build_column_paths(
+            header_block, 
+            style_grid[h_start:h_end] if style_grid else None,
+            boundaries,
+            df,
+            all_tables
+        )
         
         for r_idx in range(d_start, d_end):
             row_data = df.iloc[r_idx]
-            row_path = self._build_row_path(row_data, v_header_cols)
+            
+            # 🔥 Filter notes from row headers too
+            row_path = self._build_row_path(
+                row_data, 
+                v_header_cols,
+                r_idx,
+                boundaries,
+                df,
+                all_tables,
+                style_grid,
+                sheet_name
+            )
             
             if not row_path:
                 continue
@@ -741,7 +760,7 @@ class FinancialExcelEngine:
                 if c_idx in v_header_cols or pd.isna(val) or str(val).strip() == "":
                     continue
                 
-                # 🔥 UNIVERSAL NOTE FILTERING
+                # Existing value filtering
                 should_filter, reason = self.note_filter.should_filter_cell(
                     val, r_idx, c_idx, boundaries, df, all_tables, style_grid
                 )
@@ -769,44 +788,101 @@ class FinancialExcelEngine:
                     'table_name': table.get('name', f'Table{table_idx+1}')
                 }
                 self.records.append(record)
+
     
-    def _build_column_paths(self, header_block: pd.DataFrame) -> List[List[str]]:
-        """Build hierarchical column paths."""
-        col_paths = []
-        header_block_ffill = header_block.ffill(axis=1)
-        
-        for c in range(len(header_block.columns)):
-            col_headers = header_block_ffill.iloc[:, c].tolist()
-            
-            clean_path = []
-            for h in col_headers:
-                h_str = str(h).strip()
-                if pd.notna(h) and h_str != "" and (not clean_path or h_str != clean_path[-1]):
-                    clean_path.append(h_str)
-            
-            col_paths.append(clean_path)
-        
-        return col_paths
+    def _build_column_paths(self, header_block: pd.DataFrame, 
+                       style_grid: List[List[Dict]],
+                       boundaries: Dict[str, int],
+                       df: pd.DataFrame,
+                       tables: List[Dict]) -> List[List[str]]:
+    """Build hierarchical paths for each column with note filtering."""
+    col_paths = []
+    header_block_ffill = header_block.ffill(axis=1)
     
-    def _build_row_path(self, row_ pd.Series, v_header_cols: List[int]) -> List[str]:
-        """Build hierarchical row path."""
+    for c in range(len(header_block.columns)):
+        col_headers = header_block_ffill.iloc[:, c].tolist()
+        
+        clean_path = []
+        for h_idx, h in enumerate(col_headers):
+            if pd.isna(h):
+                continue
+                
+            h_str = str(h).strip()
+            if not h_str:
+                continue
+            
+            # 🔥 NEW: Filter notes from headers
+            actual_row_idx = header_block.index[h_idx]
+            should_filter, reason = self.note_filter.should_filter_cell(
+                h, actual_row_idx, c, boundaries, df, tables, 
+                style_grid if style_grid else None
+            )
+            
+            if should_filter:
+                self.filtered_notes.append({
+                    'sheet': '(current_sheet)',
+                    'row': actual_row_idx,
+                    'col': c,
+                    'value': h,
+                    'reason': f'header_{reason}'
+                })
+                continue  # Skip this header cell
+            
+            # Deduplicate consecutive identical headers
+            if not clean_path or h_str != clean_path[-1]:
+                clean_path.append(h_str)
+        
+        col_paths.append(clean_path)
+    
+    return col_paths
+
+    def _build_row_path(self, row_ pd.Series, v_header_cols: List[int],
+                       row_idx: int, boundaries: Dict[str, int],
+                       df: pd.DataFrame, tables: List[Dict],
+                       style_grid: List[List[Dict]],
+                       sheet_name: str) -> List[str]:
+        """Build hierarchical path from vertical headers with note filtering."""
         path = []
         
         for col_idx in v_header_cols:
-            if col_idx < len(row_data):
-                val = row_data.iloc[col_idx]
-                if pd.notna(val):
-                    val_str = str(val).strip()
-                    if val_str:
-                        val_clean = val_str.lstrip()
-                        indent_level = len(val_str) - len(val_clean)
-                        
-                        if indent_level > 0 and len(path) > 0:
-                            path = path[:-1]
-                        
-                        path.append(val_clean)
+            if col_idx >= len(row_data):
+                continue
+                
+            val = row_data.iloc[col_idx]
+            if pd.isna(val):
+                continue
+                
+            val_str = str(val).strip()
+            if not val_str:
+                continue
+            
+            # 🔥 NEW: Filter notes from row headers
+            should_filter, reason = self.note_filter.should_filter_cell(
+                val, row_idx, col_idx, boundaries, df, tables,
+                style_grid if style_grid else None
+            )
+            
+            if should_filter:
+                self.filtered_notes.append({
+                    'sheet': sheet_name,
+                    'row': row_idx,
+                    'col': col_idx,
+                    'value': val,
+                    'reason': f'row_header_{reason}'
+                })
+                continue  # Skip this row header
+            
+            # Handle indentation for hierarchies
+            val_clean = val_str.lstrip()
+            indent_level = len(val_str) - len(val_clean)
+            
+            if indent_level > 0 and len(path) > 0:
+                path = path[:-1]
+            
+            path.append(val_clean)
         
         return path
+
     
     def _build_embeddings(self, batch_size=100):
         """Build vector index."""
