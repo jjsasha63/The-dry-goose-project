@@ -10,6 +10,69 @@ New Features:
 - Semantic note detection using language patterns
 """
 
+
+import json
+import numpy as np
+import h5py
+
+def write_save(file_path: str, meta: TableMeta, config: QueryEngineConfig, overwrite: bool = False) -> None:
+    name = f"{os.path.basename(file_path).split('.')[0]}.h5"
+    save_path = os.path.join(os.path.dirname(file_path), name)
+    
+    if os.path.exists(save_path) and not overwrite:
+        raise FileExistsError(f"File {save_path} already exists")
+    
+    with h5py.File(save_path, 'w') as f:
+        # Save embeddings (vector_index) - YOUR FIX ALREADY WORKS
+        keys = list(meta.vector_index.keys())
+        vecs = np.stack([np.asarray(meta.vector_index[k], dtype=np.float32) for k in keys])
+        dt = h5py.string_dtype(encoding='utf-8')
+        
+        f.create_dataset('embedding_keys', 
+                         data=np.array(keys, dtype=dt), 
+                         compression='gzip')
+        f.create_dataset('embedding_vectors', 
+                         data=vecs, 
+                         compression='gzip')
+        
+        # FIX: Save records as JSON string instead of raw objects
+        records_json = json.dumps(meta.records, default=str)  # default=str handles non-serializable types
+        f.create_dataset('records', 
+                         data=records_json, 
+                         dtype=h5py.string_dtype(encoding='utf-8'))
+        
+        # Save table structures as JSON
+        tables_json = json.dumps(meta.tables, default=str)
+        f.create_dataset('tables', 
+                         data=tables_json, 
+                         dtype=h5py.string_dtype(encoding='utf-8'))
+    
+    print(f"✅ Saved to {save_path}")
+
+def load_from_h5(file_path: str) -> TableMeta:
+    with h5py.File(file_path, 'r') as f:
+        # Load embeddings
+        raw_keys = f['embedding_keys'][()]
+        keys = [k.decode('utf-8') if isinstance(k, bytes) else k for k in raw_keys]
+        vecs = f['embedding_vectors'][()]
+        vector_index = {k: vecs[i].tolist() for i, k in enumerate(keys)}
+        
+        # Load records from JSON
+        records_json = f['records'][()]
+        if isinstance(records_json, bytes):
+            records_json = records_json.decode('utf-8')
+        records = json.loads(records_json)
+        
+        # Load tables from JSON
+        tables_json = f['tables'][()]
+        if isinstance(tables_json, bytes):
+            tables_json = tables_json.decode('utf-8')
+        tables = json.loads(tables_json)
+    
+    meta = TableMeta(vector_index=vector_index, records=records, tables=tables)
+    return meta
+
+
 import os
 import re
 import warnings
