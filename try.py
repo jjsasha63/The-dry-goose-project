@@ -1,12 +1,13 @@
 #!/bin/bash
 set -e
 
-echo "🚀 Starting backend + frontend..."
+echo "🚀 Frontend + Backend..."
 
-# === BACKEND ===
-cd /opt/app
-source .venv/bin/activate 2>/dev/null || true
-pip install -r requirements.txt -q
+cd /opt/app/frontend
+
+# Fix proxy + build frontend
+npm config set proxy http://webproxy:8080
+all -r requirements.txt -q
 python main.py &  # Run in background
 BACKEND_PID=$!
 echo "✅ Backend started (PID $BACKEND_PID)"
