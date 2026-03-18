@@ -1,32 +1,20 @@
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import { BrowserRouter } from 'react-router-dom'
-import './index.css'
-import App from './app/App.tsx'
-import { Providers } from './app/providers.tsx'
+#!/bin/bash
+set -e
 
-// Dynamic basename: proxy OR Domino
-let basename = '/';
-const path = window.location.pathname;
+echo "🚀 Building + serving with npm preview..."
 
-// 1. Proxy pattern: /34f34f43f3/proxy/8888 → everything before /proxy/
-const proxyMatch = path.match(/^(.*?)\/proxy\/\d+$/);
-if (proxyMatch) {
-  basename = proxyMatch[1];
-}
-// 2. Domino pattern: /aice-studio/app/.../inventory-analyzer/
-else if (path.includes('/inventory-analyzer')) {
-  basename = path.substring(0, path.indexOf('/inventory-analyzer') + '/inventory-analyzer'.length);
-}
+cd /opt/app/frontend
 
-console.log('Dynamic basename:', basename, 'Full path:', path);  // DEBUG
+# Fix npm proxy (UBS)
+npm config set proxy http://webproxy:8080
+npm config set https-proxy http://webproxy:8080
+npm config set strict-ssl false
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <Providers>
-      <BrowserRouter basename={basename}>
-        <App />
-      </BrowserRouter>
-    </Providers>
-  </StrictMode>
-);
+export HTTP_PROXY=http://webproxy:8080
+export HTTPS_PROXY=http://webproxy:8080
+export NODE_OPTIONS="--max-old-space-size=6144"
+
+# Install + build + serve
+npm ci
+npm run build
+npm run preview  # Vite production server (dist/)
